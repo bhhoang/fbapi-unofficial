@@ -1,7 +1,11 @@
 # Documentation
 
 * [`login`](#login)
+* [`api.acceptCall`](#acceptCall)
 * [`api.addUserToGroup`](#addUserToGroup)
+* [`api.approveJoinRequest`](#approveJoinRequest)
+* [`api.blockGroupMember`](#blockGroupMember)
+* [`api.call`](#call)
 * [`api.changeAdminStatus`](#changeAdminStatus)
 * [`api.changeArchivedStatus`](#changeArchivedStatus)
 * [`api.changeBlockedStatus`](#changeBlockedStatus)
@@ -9,14 +13,39 @@
 * [`api.changeNickname`](#changeNickname)
 * [`api.changeThreadColor`](#changeThreadColor)
 * [`api.changeThreadEmoji`](#changeThreadEmoji)
+* [`api.connectCalls`](#connectCalls)
+* [`api.connectE2EE`](#connectE2EE)
+* [`api.createComment`](#createComment)
+* [`api.createGroup`](#createGroup)
+* [`api.createGroupPost`](#createGroupPost)
 * [`api.createPoll`](#createPoll)
+* [`api.declineCall`](#declineCall)
+* [`api.declineJoinRequest`](#declineJoinRequest)
+* [`api.deleteComment`](#deleteComment)
+* [`api.deleteGroupPost`](#deleteGroupPost)
 * [`api.deleteMessage`](#deleteMessage)
 * [`api.deleteThread`](#deleteThread)
+* [`api.downloadE2EEAttachment`](#downloadE2EEAttachment)
+* [`api.editComment`](#editComment)
+* [`api.editGroupPost`](#editGroupPost)
+* [`api.endCall`](#endCall)
+* [`api.followGroup`](#followGroup)
 * [`api.forwardAttachment`](#forwardAttachment)
 * [`api.getAppState`](#getAppState)
+* [`api.getCalls`](#getCalls)
 * [`api.getCurrentUserID`](#getCurrentUserID)
 * [`api.getEmojiUrl`](#getEmojiUrl)
+* [`api.getFeed`](#getFeed)
 * [`api.getFriendsList`](#getFriendsList)
+* [`api.getGroupEvents`](#getGroupEvents)
+* [`api.getGroupFiles`](#getGroupFiles)
+* [`api.getGroupInfo`](#getGroupInfo)
+* [`api.getGroupMedia`](#getGroupMedia)
+* [`api.getGroupMembers`](#getGroupMembers)
+* [`api.getGroupPosts`](#getGroupPosts)
+* [`api.getGroupRules`](#getGroupRules)
+* [`api.getPostComments`](#getPostComments)
+* [`api.getPostReactions`](#getPostReactions)
 * [`api.getThreadHistory`](#getThreadHistory)
 * [`api.getThreadInfo`](#getThreadInfo)
 * [`api.getThreadList`](#getThreadList)
@@ -24,23 +53,40 @@
 * [`api.getUserID`](#getUserID)
 * [`api.getUserInfo`](#getUserInfo)
 * [`api.handleMessageRequest`](#handleMessageRequest)
+* [`api.inviteToGroup`](#inviteToGroup)
+* [`api.joinGroup`](#joinGroup)
+* [`api.leaveGroup`](#leaveGroup)
+* [`api.likePost`](#likePost)
 * [`api.listen`](#listen)
 * [`api.listenMqtt`](#listenMqtt)
 * [`api.logout`](#logout)
 * [`api.markAsDelivered`](#markAsDelivered)
 * [`api.markAsRead`](#markAsRead)
 * [`api.markAsReadAll`](#markAsReadAll)
+* [`api.markGroupVisited`](#markGroupVisited)
 * [`api.muteThread`](#muteThread)
+* [`api.pinGroupPost`](#pinGroupPost)
+* [`api.removeGroupMember`](#removeGroupMember)
 * [`api.removeUserFromGroup`](#removeUserFromGroup)
 * [`api.resolvePhotoUrl`](#resolvePhotoUrl)
+* [`api.restoreE2EEBackup`](#restoreE2EEBackup)
 * [`api.searchForThread`](#searchForThread)
+* [`api.searchGroupMembers`](#searchGroupMembers)
+* [`api.searchMessages`](#searchMessages)
+* [`api.searchGroupPosts`](#searchGroupPosts)
 * [`api.sendMessage`](#sendMessage)
 * [`api.sendTypingIndicator`](#sendTypingIndicator)
+* [`api.setCommentReaction`](#setCommentReaction)
 * [`api.setMessageReaction`](#setMessageReaction)
 * [`api.setOptions`](#setOptions)
+* [`api.setPostReaction`](#setPostReaction)
 * [`api.setTitle`](#setTitle)
 * [`api.threadColors`](#threadColors)
+* [`api.unfollowGroup`](#unfollowGroup)
+* [`api.unpinGroupPost`](#unpinGroupPost)
 * [`api.unsendMessage`](#unsendMessage)
+* [`api.updateGroup`](#updateGroup)
+* [`api.updateGroupDiscoverability`](#updateGroupDiscoverability)
 
 ---------------------------------------
 
@@ -86,9 +132,44 @@ If it fails, `callback` will be called with an error object.
 
 __Arguments__
 
-* `credentials`: An object containing the fields `email` and `password` used to login, __*or*__ an object containing the field `appState`.
+* `credentials`: An object with the fields `email` and `password` used to login (the `email` field also accepts a phone number or the numeric user ID), __*or*__ an object containing the field `appState`. For accounts with an authenticator app (TOTP) you can also pass `twoFactorSecret` — the base32 secret shown when 2FA was set up — and the library will generate the code itself.
 * `options`: An object representing options to use when logging in (as described in [api.setOptions](#setOptions)).
 * `callback(err, api)`: A callback called when login is done (successful or not). `err` is an object containing a field `error`.
+
+> **Note:** When a `twoFactorSecret` is provided (or `mobileLogin: true` is
+> set), the login goes through Facebook's mobile app auth endpoint instead of
+> the web form. That endpoint reports the two-factor challenge explicitly and
+> accepts the generated TOTP code, so it can complete a 2FA login
+> programmatically — no web CAPTCHA involved. Without a `twoFactorSecret` the
+> web form is used; if Facebook then wants an interactive security check
+> (Arkose CAPTCHA) before accepting the code, the login fails with
+> `err.twoFactorRequired === true`. Pass `mobileLogin: false` to always use the
+> web form. `appState` remains the recommended approach for unattended scripts.
+>
+> The mobile login uses a persisted device identity (default
+> `./mobile_device.json`, configurable with `api.setOptions({ mobileDevicePath })`)
+> because Facebook binds two-factor challenges and "Someone is trying to log in /
+> Approve this login" prompts to a device. If Facebook asks for approval, approve
+> the prompt from the Facebook app on another signed-in device and run the login
+> again — the same device identity is reused, so the approval applies. Avoid
+> making many attempts in a row: Facebook temporarily answers with a generic
+> "Wrong username/password" while it rate-limits repeated failures.
+
+__Example (Email & Password with TOTP 2FA)__
+
+```js
+const login = require("facebook-chat-api");
+
+login({
+    email: "FB_EMAIL",
+    password: "FB_PASSWORD",
+    twoFactorSecret: "BASE32_TOTP_SECRET", // authenticator app secret
+    mobileLogin: true                      // optional; implied by twoFactorSecret
+}, (err, api) => {
+    if(err) return console.error(err);
+    // Here you can use the api
+});
+```
 
 __Example (Email & Password)__
 
@@ -126,7 +207,33 @@ login({appState: JSON.parse(fs.readFileSync('appstate.json', 'utf8'))}, (err, ap
 });
 ```
 
-__Login Approvals (2-Factor Auth)__: When you try to login with Login Approvals enabled, your callback will be called with an error `'login-approval'` that has a `continue` function that accepts the approval code as a `string` or a `number`.
+__Example (Refresh a session with email & password)__
+
+Pass the `appState` **together with** `email`/`password` to re-authenticate on the
+same browser device. The device cookies (`datr`, `sb`, ...) from the appState
+are reused, so Facebook sees a recognized browser instead of a brand-new device
+— no "unrecognized device" lock and normally no two-factor challenge. This is
+the way to keep a long-running bot's session fresh from stored credentials, and
+it also refreshes the appState:
+
+```js
+const fs = require("fs");
+const login = require("facebook-chat-api");
+
+login({
+    appState: JSON.parse(fs.readFileSync('appstate.json', 'utf8')),
+    email: "FB_EMAIL",
+    password: "FB_PASSWORD",
+    twoFactorSecret: "BASE32_TOTP_SECRET" // used only if Facebook asks for a code
+}, (err, api) => {
+    if(err) return console.error(err);
+
+    // Save the refreshed session for next time.
+    fs.writeFileSync('appstate.json', JSON.stringify(api.getAppState(), null, 2));
+});
+```
+
+__Login Approvals (2-Factor Auth)__: When you try to login with Login Approvals enabled, your callback will be called with an error `'login-approval'` that has a `continue` function that accepts the approval code as a `string` or a `number`. If you passed `twoFactorSecret` in the credentials, the library generates and submits the TOTP code itself instead.
 
 __Example__:
 
@@ -176,6 +283,161 @@ __Arguments__
 * `userID`: User ID or array of user IDs.
 * `threadID`: Group chat ID.
 * `callback(err)`: A callback called when the query is done (either with an error or with no arguments).
+
+---------------------------------------
+
+<a name="approveJoinRequest"></a>
+### api.approveJoinRequest(groupID, userID[, callback])
+
+Approves a pending request to join a Facebook Group (requires admin/moderator rights). The user must have a pending request — you can see pending users with [`api.getGroupInfo`](#getGroupInfo) on their account, or in the group's Member requests page.
+
+__Arguments__
+
+* `groupID`: The ID of the Facebook Group.
+* `userID`: The ID of the user whose request to approve.
+* `callback(err, result)`: Called with `{groupID, userID, approved: true}`.
+
+---------------------------------------
+
+<a name="blockGroupMember"></a>
+### api.blockGroupMember(groupID, userID[, callback])
+
+Bans (blocks) a member from a Facebook Group — the "Ban from group" action in the member menu. Requires admin/moderator rights. Facebook refuses to ban the last admin.
+
+__Arguments__
+
+* `groupID`: The ID of the Facebook Group.
+* `userID`: The ID of the member to ban.
+* `callback(err, result)`: Called with `{groupID, userID, blocked: true}`.
+
+---------------------------------------
+
+<a name="call"></a>
+### api.call(threadID[, options], callback)
+
+Places a voice (or video) call through Messenger's call signaling. `threadID` is the user ID to call, or the group thread ID when `options.groupThreadID` is set.
+
+Signaling is sent on the same MQTT connection used by [`api.listenMqtt`](#listenMqtt); an internal connection is opened automatically the first time a call function is used. `api.listenMqtt` does not have to be running, but it is the only way to receive [call events](#call-events).
+
+__Signaling-only by default__: without the `media` option no audio is transmitted — a synthesized SDP offer is sent so the called device rings, shows the call and can answer or decline.
+
+__Real audio (`options.media`)__: pass `media: true` to negotiate a real WebRTC audio connection. Audio comes from a 16-bit PCM WAV file and/or goes to a WAV recording — Node has no microphone, so both are file/callback based. Two media engines are supported:
+
+* **`@roamhq/wrtc`** (`npm install @roamhq/wrtc`, the full libwebrtc stack) — preferred when installed: Opus is built in, and it supports ICE-TCP and TURN relays over TCP/TLS, which the restricted networks need. This is the engine that was verified working against Facebook's conference.
+* **`werift`** (`npm install werift`, pure JavaScript) + optional [`opusscript`](https://www.npmjs.com/package/opusscript) for Opus — a lighter fallback.
+
+Facebook's call relays (TURN) are fetched automatically (`/videocall/turndiscovery/`) before the media is created, and the client subscribes to the conference's dominant-speaker stream and answers the SFU's renegotiation offers, so audio is both sent and received:
+
+```js
+api.call(userID, {
+  media: {
+    audioFile: "tts.wav",     // streamed to the call in a loop (8/16/44.1 kHz PCM WAV)
+    recordFile: "call.wav",   // written when the call ends
+    onAudioData: function(pcm8k) {}, // optional live incoming PCM
+    engine: "wrtc",           // "wrtc" (default when installed) or "werift"
+    codec: "opus",            // werift engine: "opus" (default when available) or "pcmu"
+    autoStart: false,         // true = start the file as soon as the media is up
+    audioDelayMs: 3000,       // group calls: wait this long after the peer joins
+    iceServers: [],           // extra STUN/TURN servers (Facebook's relays are applied automatically)
+    iceInterfaceAddresses: [],// pin ICE to specific local interfaces on multi-homed machines
+    turnTransport: "tcp",     // prefer the relay over TCP/TLS (restrictive networks)
+    opusBitrate: 128000       // Opus target bitrate in bps (default 128000, max 510000)
+  }
+}, callback);
+```
+
+The audio file is held until the other side is actually in the call (the group-call participant state reaches `CONNECTED`, or the 1:1 call is answered) and then starts after `audioDelayMs` (default 3 s), so the beginning of the file is not played to an empty conference. `autoStart: true` restores the immediate start.
+
+> Media uses the network the same way the web client does: **direct UDP (STUN), ICE-TCP, and Facebook's TURN relays (UDP, plain TCP, TLS)**. On networks that block outbound UDP to Facebook (some VPNs, locked-down corporate links) the client falls back to the TCP transports — the `werift` engine carries DTLS/SRTP over ICE-TCP and TURN-TCP, which has been verified against the conference edge. Set `turnTransport: "tcp"` to prefer the relay over TCP when the direct paths are blocked.
+
+__E2EE (secure) calls__: one-to-one Messenger chats are end-to-end encrypted, so calls placed on them are E2EE mandated. Facebook requires the client's E2EE call state (the `E2eeState` state-sync topic) when joining; this library builds it from its own E2EE device (registering one automatically if needed), and signs the DTLS handshake with the account's identity key (`a=x-dtls-auth`, generated with Meta's frame-encryption wasm, downloaded and cached on first use). Group calls are not E2EE mandated.
+
+Real media for **one-to-one E2EE** calls works as well: the clients trade `E2eeKey` data messages, derive the SFrame keys from them, and every audio frame is encrypted before it leaves the socket and decrypted on arrival (Meta's frame-encryption wasm runs in a helper process). The library subscribes to the peer's track in the conference, answers the SFU's renegotiation offers, and carries the media over ICE-TCP/TURN-TCP when UDP is blocked. Scope: one-to-one voice.
+
+__Arguments__
+
+* `threadID`: The ID of the user (or group thread) to call.
+* `options`: Optional object.
+  * `video`: `true` to request a video call (default is audio).
+  * `e2ee`: Set to `false` for a non-E2EE call (default: `true` for one-to-one calls, `false` for group calls).
+  * `e2eeState`: Buffer with the E2EE call state. Built automatically from the library's E2EE device when omitted.
+  * `syncPayload`: Full state-sync payload to send instead of the built-in one.
+  * `media`: `true`, or an object (`audioFile`, `recordFile`, `onAudioData`, `engine`, `codec`, `opusBitrate`, `iceServers`) for real WebRTC audio. Requires one of the optional media engines. See above.
+  * `offerSdp`: SDP offer to send (default: a synthesized audio/video offer).
+  * `groupThreadID`: Call a group thread, ringing the users in `invitees`.
+  * `invitees`: For group calls, the user IDs to ring (default: `[threadID]`).
+  * `mediaMode`: `1` (SFU, default for groups) or `2` (P2P, default for one-to-one).
+  * `callTrigger`: Value for the `call_trigger` joining-context field.
+  * `timeout`: Milliseconds to wait for Facebook to accept the call (default `20000`).
+* `callback(err, call)`: Called when the call is ringing (or failed). `call` contains `callID` (the thread ID), `state`, `conferenceName`, etc.
+
+__Example__
+
+```js
+api.call(userID, { video: false }, function(err, call) {
+  if (err) return console.error(err.error);
+  console.log("ringing", call.callID);
+  // hang up after 10 seconds
+  setTimeout(function() { api.endCall(call.callID); }, 10000);
+});
+```
+
+---------------------------------------
+
+<a name="acceptCall"></a>
+### api.acceptCall([callID][, options], callback)
+
+Accepts a ringing incoming call. Send the ringing event through [`api.listenMqtt`](#call-events) to learn the `callID`. If only one call is active, `callID` can be omitted.
+
+__Arguments__
+
+* `callID`: Optional `callID`/`threadID` of the incoming call.
+* `options`: Optional object with the same `e2ee`, `e2eeState`, `syncPayload`, `offerSdp` and `answerSdp` fields as [`api.call`](#call). When the incoming call is E2EE mandated, the E2EE state is required.
+* `callback(err, call)`: Called when the join is sent (or with an error).
+
+---------------------------------------
+
+<a name="declineCall"></a>
+### api.declineCall([callID][, callback])
+
+Declines a ringing incoming call (hangup with reason `IGNORE_CALL`). `callID` can be omitted when only one call is active.
+
+* `callback(err, call)`: Called when the hangup is sent (or with an error).
+
+---------------------------------------
+
+<a name="endCall"></a>
+### api.endCall([callID][, callback])
+
+Ends an active call, or cancels a call that is still ringing (hangup with reason `HANGUP_CALL`). `callID` can be omitted when only one call is active.
+
+* `callback(err, call)`: Called when the hangup is sent (or with an error).
+
+---------------------------------------
+
+<a name="getCalls"></a>
+### api.getCalls([callback])
+
+Returns an array describing the calls this client currently knows about (ringing, incoming or connected): `callID`, `threadID`, `peerID`, `callerID`, `direction` (`"outgoing"`/`"incoming"`), `state` (`"starting"`, `"ringing"`, `"incoming"`, `"joining"`, `"connected"`), `isGroup`, `isVideo`, `conferenceName`, `mediaPath` and `startedAt`.
+
+### Call events
+
+While [`api.listenMqtt`](#listenMqtt) is running, call signaling is reported through the same callback:
+
+* `{type: "call", event: "ring", callID, peerID, isVideo, isGroup}`: an incoming call is ringing. Answer with [`api.acceptCall`](#acceptCall) or [`api.declineCall`](#declineCall).
+* `{type: "call", event: "calling"}`: an outgoing call was accepted by Facebook and the peer is ringing.
+* `{type: "call", event: "connected"}`: the peer answered.
+* `{type: "call", event: "ended", reason}`: the call ended (for example `HANGUP_CALL`, `IGNORE_CALL`, `NO_ANSWER_TIMEOUT` or a `DismissReason`).
+
+```js
+api.listenMqtt(function(err, event) {
+  if (!event || event.type !== "call") return;
+  if (event.event === "ring") {
+    console.log("incoming call from", event.peerID);
+    // api.acceptCall(event.callID); // or api.declineCall(event.callID);
+  }
+});
+```
 
 ---------------------------------------
 
@@ -370,6 +632,197 @@ login({appState: JSON.parse(fs.readFileSync('appstate.json', 'utf8'))}, (err, ap
 
 ---------------------------------------
 
+<a name="connectCalls"></a>
+### api.connectCalls([callback])
+
+Opens the call-signaling connection and subscribes to Messenger's call topic. The call functions ([`api.call`](#call), [`api.acceptCall`](#acceptCall), ...) connect lazily, but an incoming call can only be reported while this connection (and [`api.listenMqtt`](#listenMqtt)) are running — call `api.connectCalls()` at startup to wait for calls.
+
+* `callback(err)`: Optional callback called when the signaling connection is ready (or failed).
+
+<a name="connectE2EE"></a>
+### api.connectE2EE([callback])
+
+Connects the built-in end-to-end encryption client. This is normally done automatically by [`api.sendMessage`](#sendMessage) the first time it sends to an encrypted one-to-one chat; calling it explicitly just connects ahead of time (for example to avoid the extra startup delay on the first send).
+
+`connectE2EE` fetches a Crypto Auth Token, registers this library as an E2EE device for the logged-in account the first time it runs (stored in the device file, see `e2eeDevicePath` in [api.setOptions](#setOptions)), opens the encrypted Noise/WebSocket connection Messenger's E2EE clients use, and uploads one-time prekeys. It is idempotent: calling it again while connected is a no-op.
+
+__Arguments__
+
+* `callback(err, info)`: (Optional) A callback called when the connection is ready (or failed). `info` contains `userId` and the numeric E2EE `deviceId` assigned to this library.
+
+__Example__
+
+```js
+const fs = require("fs");
+const login = require("facebook-chat-api");
+
+login({appState: JSON.parse(fs.readFileSync('appstate.json', 'utf8'))}, (err, api) => {
+    if(err) return console.error(err);
+
+    api.connectE2EE((err, info) => {
+        if(err) return console.error(err);
+        console.log("E2EE connected as device " + info.deviceId);
+    });
+});
+```
+
+---------------------------------------
+
+<a name="searchMessages"></a>
+### api.searchMessages(threadID, query[, options], callback)
+
+Searches messages of a single chat by paging through [`api.getThreadHistory`](#getThreadHistory), so it works both for regular chats (GraphQL history) and for end-to-end encrypted chats whose backup has been restored (see [`api.restoreE2EEBackup`](#restoreE2EEBackup)). Matching is a case-insensitive substring test on the message body (or the event snippet for events).
+
+__Arguments__
+
+* `threadID`: The thread to search in (user id for one-to-one chats, thread id for groups).
+* `query`: The string to look for.
+* `options`: Optional object:
+  * `amount`: Maximum number of messages to scan (default 300).
+  * `pageSize`: How many messages to fetch per page (default 50, max 500).
+  * `limit`: Maximum number of matches to return (default 50).
+  * `caseSensitive`: Set to `true` for a case-sensitive search (default `false`).
+  * `before`: Only search messages older than this timestamp (milliseconds).
+* `callback(err, matches)`: Called with an array of matching history entries, newest first (same shape as `getThreadHistory`).
+
+__Example__
+
+```js
+api.searchMessages("100035400259877", "meeting", {amount: 500}, (err, matches) => {
+    if(err) return console.error(err);
+    matches.forEach(m => console.log(m.senderID + ": " + m.body));
+});
+```
+
+---------------------------------------
+
+<a name="restoreE2EEBackup"></a>
+### api.restoreE2EEBackup(options[, callback])
+
+Restores the account's encrypted backup ("Secure Storage") so end-to-end encrypted chat history can be read by [`api.getThreadHistory`](#getThreadHistory). Everything runs natively: the 40-character recovery code derives the virtual device keys, the encrypted secrets are fetched and decrypted, the epoch keys are derived with Meta's Labyrinth WASI module (downloaded and cached on first use, needs Node.js 18+), and the resulting state (device id, mailbox tokens, epoch keys) is stored in the E2EE device file. After a successful restore, `getThreadHistory` returns real backup messages for one-to-one encrypted chats.
+
+__Arguments__
+
+* `options`: Object:
+  * `recoveryCode`: The account's 40-character recovery code (the one shown when Secure Storage was set up).
+  * `virtualDeviceInfo`: (Optional, advanced) A previously fetched `fetch_virtual_device_info_for_device_addition_v2` payload, to skip the server fetch.
+  * `deviceId`: (Optional) Server device entity id to read through; discovered from the backup's device list when omitted.
+  * `mailboxRootKey`, `ocmfClientState`, `epochs`: (Optional, advanced) Overrides for the derived values.
+  * `wasmPath`: (Optional) Cache path for the `Labyrinth_REPL` wasm module (default: a file in the system temp directory).
+* `callback(err, info)`: Called with `{backupId, deviceId, epochs}` when the backup state has been saved.
+
+__Example__
+
+```js
+api.restoreE2EEBackup({recoveryCode: "20UX M63K MFAX R0HZ R7AU CSMJ FRTZ 7ZLV ZYPX HAFY"}, (err, info) => {
+    if(err) return console.error(err);
+    console.log("backup restored, " + info.epochs + " epoch key(s)");
+
+    api.getThreadHistory(someUserID, 20, null, (err, history) => {
+        if(err) return console.error(err);
+        history.forEach(m => console.log(m.senderID + ": " + m.body));
+    });
+});
+```
+
+---------------------------------------
+
+<a name="createComment"></a>
+### api.createComment(postID, message[, options], callback)
+
+Comments on a Facebook post (a post in a Facebook Group or in the feed, not a Messenger message; see [`api.sendMessage`](#sendMessage) for chats). Uses Facebook's internal GraphQL API, which is not part of the official platform — the operation ID behind it can change when Facebook ships a new frontend.
+
+__Arguments__
+
+* `postID`: The ID of the post to comment on (as returned in `postID` by [`api.getGroupPosts`](#getGroupPosts) / [`api.getFeed`](#getFeed)).
+* `message`: String with the comment body (or an object with a `body` field).
+* `options`: Optional object. Set `replyToCommentID` to the numeric ID of a comment to post the message as a reply to that comment.
+* `callback(err, comment)`: Called with the created comment, `{commentID, postID, body}`. `commentID` is Facebook's numeric comment (feedback) ID.
+
+__Example__
+
+```js
+const fs = require("fs");
+const login = require("facebook-chat-api");
+
+login({appState: JSON.parse(fs.readFileSync('appstate.json', 'utf8'))}, (err, api) => {
+    if(err) return console.error(err);
+
+    api.createComment("1608281820936422", "Nice one!", (err, comment) => {
+        if(err) return console.error(err);
+        console.log("commented:", comment.commentID);
+
+        // Reply to that comment:
+        api.createComment("1608281820936422", "Thanks!", {replyToCommentID: comment.commentID}, (err2) => {
+            if(err2) return console.error(err2);
+        });
+    });
+});
+```
+
+---------------------------------------
+
+<a name="createGroup"></a>
+### api.createGroup(name[, options][, callback])
+
+Creates a new Facebook Group (not a Messenger group chat) owned by the logged-in account.
+
+__Arguments__
+
+* `name`: String with the group name.
+* `options`: Optional object:
+  * `privacy`: `"PRIVATE"` (default) or `"PUBLIC"`.
+  * `discoverability`: `"ANYONE"` (default) or `"MEMBERS_ONLY"`.
+  * `members`: Array of user IDs to add as initial members (optional).
+* `callback(err, group)`: Called with the created group, `{groupID, name, url, privacy, discoverability}`.
+
+__Example__
+
+```js
+const fs = require("fs");
+const login = require("facebook-chat-api");
+
+login({appState: JSON.parse(fs.readFileSync('appstate.json', 'utf8'))}, (err, api) => {
+    if(err) return console.error(err);
+
+    api.createGroup("My test group", {privacy: "PRIVATE", discoverability: "MEMBERS_ONLY"}, (err, group) => {
+        if(err) return console.error(err);
+        console.log("created group:", group.groupID);
+    });
+});
+```
+
+---------------------------------------
+
+<a name="createGroupPost"></a>
+### api.createGroupPost(groupID, message[, callback])
+
+Creates a text post in a Facebook Group the logged-in account belongs to.
+
+__Arguments__
+
+* `groupID`: The ID of the Facebook Group.
+* `message`: String with the post body (or an object with a `body` field).
+* `callback(err, post)`: Called with the created post, `{postID, groupID, body, url}`.
+
+__Example__
+
+```js
+const fs = require("fs");
+const login = require("facebook-chat-api");
+
+login({appState: JSON.parse(fs.readFileSync('appstate.json', 'utf8'))}, (err, api) => {
+    if(err) return console.error(err);
+
+    api.createGroupPost("1608281640936440", "Hello group!", (err, post) => {
+        if(err) return console.error(err);
+        console.log("posted:", post.url);
+    });
+});
+```
+
+---------------------------------------
+
 <a name="createPoll"></a>
 ### api.createPoll(title, threadID[, options][, callback])
 
@@ -398,6 +851,53 @@ login({appState: JSON.parse(fs.readFileSync('appstate.json', 'utf8'))}, (err, ap
     });
 });
 ```
+
+---------------------------------------
+
+<a name="declineJoinRequest"></a>
+### api.declineJoinRequest(groupID, userID[, callback])
+
+Declines a pending request to join a Facebook Group (requires admin/moderator rights).
+
+__Arguments__
+
+* `groupID`: The ID of the Facebook Group.
+* `userID`: The ID of the user whose request to decline.
+* `callback(err, result)`: Called with `{groupID, userID, declined: true}`.
+
+---------------------------------------
+
+<a name="deleteComment"></a>
+### api.deleteComment(postID, commentID[, callback])
+
+Deletes a comment the logged-in account wrote on a Facebook post.
+
+__Arguments__
+
+* `postID`: The ID of the post the comment is on.
+* `commentID`: The numeric comment ID (as returned by [`api.createComment`](#createComment)).
+* `callback(err, result)`: Called with `{postID, commentID, deleted}`.
+
+__Example__
+
+```js
+api.deleteComment("1608281820936422", "1608303754267562", (err) => {
+    if(err) return console.error(err);
+});
+```
+
+---------------------------------------
+
+<a name="deleteGroupPost"></a>
+### api.deleteGroupPost(postID[, options][, callback])
+
+Deletes a post (requires that the logged-in account is allowed to delete it — its author, or a group admin).
+
+__Arguments__
+
+* `postID`: The ID of the post.
+* `options`: Optional; `authorID` is the post author's user ID (defaults to the logged-in account). Facebook's `story_id` token embeds the author, so posts by other people need it (available as `senderID` from [`api.getGroupPosts`](#getGroupPosts)).
+* `callback(err, result)`: Called with `{postID, deleted: true}`.
 
 ---------------------------------------
 
@@ -456,6 +956,100 @@ login({appState: JSON.parse(fs.readFileSync('appstate.json', 'utf8'))}, (err, ap
     });
 });
 ```
+
+---------------------------------------
+
+<a name="downloadE2EEAttachment"></a>
+### api.downloadE2EEAttachment(attachment[, callback])
+
+Downloads, decrypts and returns the media of an attachment received on an end-to-end encrypted one-to-one chat.
+
+Messages delivered by `api.listen`/`api.listenMqtt` from the built-in E2EE client carry an `attachments` array. Those media are encrypted with a per-file key that is only present in the message, so they cannot be fetched with a URL: pass one `attachments` entry (the one with an `e2ee` field) to this method to get the plaintext bytes. The media itself is hosted by Facebook's encrypted media service and downloaded over the same E2EE client connection, so the E2EE client must be able to connect (it is created/connected on demand, same as for [`api.sendMessage`](#sendMessage)). The returned `attachment.type` is one of `photo`, `video`, `audio`, `sticker` or `file`.
+
+Group E2EE messages and attachments are not decrypted by this library, so this method only works for the one-to-one attachments that were actually delivered.
+
+__Arguments__
+
+* `attachment`: One entry from a message's `attachments` array (the one with the `e2ee` field).
+* `callback(err, buffer)`: Called with the decrypted media as a `Buffer`, or an error.
+
+__Example__
+
+```js
+api.listenMqtt((err, message) => {
+    if (err) return console.error(err);
+    if (!message.attachments || !message.attachments.length) return;
+
+    var attachment = message.attachments[0];
+    api.downloadE2EEAttachment(attachment, (err, buffer) => {
+        if (err) return console.error(err);
+        var fs = require("fs");
+        var name = attachment.filename || "attachment";
+        fs.writeFileSync(name, buffer);
+        console.log("Saved " + name + " (" + buffer.length + " bytes)");
+    });
+});
+```
+
+---------------------------------------
+
+<a name="editComment"></a>
+### api.editComment(postID, commentID, message[, callback])
+
+Edits a comment the logged-in account wrote on a Facebook post.
+
+__Arguments__
+
+* `postID`: The ID of the post the comment is on.
+* `commentID`: The numeric comment ID.
+* `message`: String with the new comment body (or an object with a `body` field).
+* `callback(err, comment)`: Called with `{postID, commentID, body}`.
+
+__Example__
+
+```js
+api.editComment("1608281820936422", "1608303754267562", "Actually, great one!", (err) => {
+    if(err) return console.error(err);
+});
+```
+
+---------------------------------------
+
+<a name="editGroupPost"></a>
+### api.editGroupPost(postID, message[, options][, callback])
+
+Edits the text of a Facebook post (author or admin).
+
+__Arguments__
+
+* `postID`: The ID of the post.
+* `message`: String with the new post body.
+* `options`: Optional; `authorID` is the post author's user ID (defaults to the logged-in account); see [`api.deleteGroupPost`](#deleteGroupPost).
+* `callback(err, result)`: Called with `{postID, body}`.
+
+---------------------------------------
+
+<a name="followGroup"></a>
+### api.followGroup(groupID[, callback])
+
+Starts following a Facebook Group (its posts show up in the home feed).
+
+__Arguments__
+
+* `groupID`: The ID of the Facebook Group.
+* `callback(err, result)`: Called with `{groupID, following: true}`.
+
+---------------------------------------
+
+<a name="unfollowGroup"></a>
+### api.unfollowGroup(groupID[, callback])
+
+Stops following a Facebook Group.
+
+__Arguments__
+
+* `groupID`: The ID of the Facebook Group.
+* `callback(err, result)`: Called with `{groupID, following: false}`.
 
 ---------------------------------------
 
@@ -520,6 +1114,40 @@ login({appState: JSON.parse(fs.readFileSync('appstate.json', 'utf8'))}, (err, ap
 
 ---------------------------------------
 
+<a name="getFeed"></a>
+### api.getFeed([amount][, options][, callback])
+
+Returns posts from the logged-in account's home news feed (as shown on facebook.com). Uses Facebook's internal GraphQL API, so the operation ID can change when Facebook ships a new frontend.
+
+__Arguments__
+
+* `amount`: Optional number of posts to request (default 5).
+* `options`: Optional object; `cursor` continues from a previous call's `pageInfo.endCursor`.
+* `callback(err, posts, pageInfo)`: Called with an array of posts and `pageInfo` `{endCursor, hasNextPage}`. Each post has the fields `postID`, `senderID`, `senderName`, `body`, `timestamp` (milliseconds), `url`, `reactionCount`, `commentCount` and `shareCount`.
+
+__Example__
+
+```js
+const fs = require("fs");
+const login = require("facebook-chat-api");
+
+login({appState: JSON.parse(fs.readFileSync('appstate.json', 'utf8'))}, (err, api) => {
+    if(err) return console.error(err);
+
+    api.getFeed(5, (err, posts, pageInfo) => {
+        if(err) return console.error(err);
+        posts.forEach(post => console.log(post.senderName + ": " + post.body));
+
+        api.getFeed(5, {cursor: pageInfo.endCursor}, (err2, more) => {
+            if(err2) return console.error(err2);
+            console.log("next page:", more.length);
+        });
+    });
+});
+```
+
+---------------------------------------
+
 <a name="getFriendsList"></a>
 ### api.getFriendsList(callback)
 
@@ -548,12 +1176,232 @@ login({appState: JSON.parse(fs.readFileSync('appstate.json', 'utf8'))}, (err, ap
 
 ---------------------------------------
 
+<a name="getGroupEvents"></a>
+### api.getGroupEvents(groupID[, amount][, callback])
+
+Returns a Facebook Group's events (upcoming and past), newest first per section. Requires the group's Events feature to be enabled; an empty array is returned otherwise.
+
+__Arguments__
+
+* `groupID`: The ID of the Facebook Group.
+* `amount`: Optional number of events to request (default 3).
+* `options`: Optional object:
+  * `section`: `"upcoming"` (default) or `"past"`.
+  * `cursor`: Cursor from a previous call to fetch the next page of a section (requires `section`).
+* `callback(err, events, pageInfo)`: Called with an array of events and pagination info. Without a cursor, `pageInfo` is `{upcoming, past}`, each `{endCursor, hasNextPage}`; with a cursor, it's a single `{endCursor, hasNextPage}` for that section. Each event has `eventID`, `name`, `url`, `startTimestamp`, `endTimestamp`, `place`, `isPast`.
+
+__Example__
+
+```js
+api.getGroupEvents("123456789", 10, (err, events, pageInfo) => {
+    if(err) return console.error(err);
+    if (pageInfo.upcoming && pageInfo.upcoming.hasNextPage) {
+        api.getGroupEvents("123456789", 10, {section: "upcoming", cursor: pageInfo.upcoming.endCursor}, (err2, more) => {
+            if(err2) return console.error(err2);
+            console.log("more upcoming events:", more.length);
+        });
+    }
+});
+```
+
+---------------------------------------
+
+<a name="getGroupFiles"></a>
+### api.getGroupFiles(groupID[, callback])
+
+Returns files shared in a Facebook Group's Files tab. Requires the group's Files feature and uploads to exist; an empty array is returned otherwise.
+
+__Arguments__
+
+* `groupID`: The ID of the Facebook Group.
+* `options`: Optional object:
+  * `cursor`: Cursor from a previous call's `pageInfo.endCursor` to fetch the next page.
+  * `name`: Filter by file name.
+  * `orderby`: Optional ordering value.
+  * `amount`: Page size when using a cursor (default 15).
+* `callback(err, files, pageInfo)`: Called with an array of files and `pageInfo` `{endCursor, hasNextPage}`. Each file has `fileID`, `name`, `url`, `type`, `modifiedTime`, `uploader` (`{userID, name}`).
+
+---------------------------------------
+
+<a name="getGroupInfo"></a>
+### api.getGroupInfo(groupID[, callback])
+
+Returns information about a Facebook Group: name, url, description, privacy and discoverability, member count, whether the logged-in account is a member/admin, its join state, follow (subscribe) status and whether the group is pinned to the top of the groups list.
+
+__Arguments__
+
+* `groupID`: The ID of the Facebook Group.
+* `callback(err, info)`: Called with the group info object.
+
+__Example__
+
+```js
+api.getGroupInfo("1608281640936440", (err, info) => {
+    if(err) return console.error(err);
+    console.log(info.name, "|", info.privacy, "|", info.memberCount, "members");
+});
+```
+
+---------------------------------------
+
+<a name="getGroupMedia"></a>
+### api.getGroupMedia(groupID[, amount][, callback])
+
+Returns photos and videos from a Facebook Group's Media tab, newest first.
+
+__Arguments__
+
+* `groupID`: The ID of the Facebook Group.
+* `amount`: Optional number of items to request (default 8).
+* `callback(err, items)`: Called with an array of items. Each item has `id`, `type` (`"photo"` or `"video"`), `image` (preview URL), `width`, `height` and `url`.
+
+__Example__
+
+```js
+api.getGroupMedia("750279539095674", 8, (err, items) => {
+    if(err) return console.error(err);
+    items.forEach(item => console.log(item.type, item.id));
+});
+```
+
+---------------------------------------
+
+<a name="getGroupMembers"></a>
+### api.getGroupMembers(groupID[, amount][, callback])
+
+Returns members of a Facebook Group. Facebook's group UI serves the People tab through its member search, so this returns a sample of members (recently joined/active) in the same order the UI shows them; use [`api.searchGroupMembers`](#searchGroupMembers) to look for specific people.
+
+__Arguments__
+
+* `groupID`: The ID of the Facebook Group.
+* `amount`: Optional number of members to request (default 20).
+* `callback(err, members)`: Called with an array of members. Each member has `userID`, `name`, `url`, `joinedText` (e.g. `"Joined about 5 months ago"`), `city` (profile bio/location when public) and `profilePicture`.
+
+__Example__
+
+```js
+api.getGroupMembers("750279539095674", 20, (err, members) => {
+    if(err) return console.error(err);
+    members.forEach(m => console.log(m.userID, m.name, m.joinedText));
+});
+```
+
+---------------------------------------
+
+<a name="getGroupPosts"></a>
+### api.getGroupPosts(groupID[, amount][, options][, callback])
+
+Returns posts from a Facebook Group's feed (not a Messenger group chat; see [`api.getThreadHistory`](#getThreadHistory) for chats). Posts are returned newest first. Uses Facebook's internal GraphQL API, so the operation ID can change when Facebook ships a new frontend.
+
+__Arguments__
+
+* `groupID`: The ID of the Facebook Group.
+* `amount`: Optional number of posts to request (default 10).
+* `options`: Optional object:
+  * `cursor`: Cursor from a previous call's `pageInfo.endCursor` to fetch the next page.
+  * `sortingSetting`: `"CHRONOLOGICAL"` (default) or `"RECENT_ACTIVITY"`.
+* `callback(err, posts, pageInfo)`: Called with an array of posts and a `pageInfo` object `{endCursor, hasNextPage}`. Pass `pageInfo.endCursor` as `options.cursor` for the next page. Each post has the fields `postID`, `groupID`, `senderID`, `senderName`, `body`, `timestamp` (milliseconds), `url`, `reactionCount`, `commentCount` and `shareCount`.
+
+__Example__
+
+```js
+const fs = require("fs");
+const login = require("facebook-chat-api");
+
+login({appState: JSON.parse(fs.readFileSync('appstate.json', 'utf8'))}, (err, api) => {
+    if(err) return console.error(err);
+
+    api.getGroupPosts("1608281640936440", 10, (err, posts, pageInfo) => {
+        if(err) return console.error(err);
+        console.log("first page:", posts.length, "| more:", pageInfo.hasNextPage);
+
+        // Next page:
+        api.getGroupPosts("1608281640936440", 10, {cursor: pageInfo.endCursor}, (err2, more) => {
+            if(err2) return console.error(err2);
+            console.log("second page:", more.length);
+        });
+    });
+});
+```
+
+---------------------------------------
+
+<a name="getGroupRules"></a>
+### api.getGroupRules(groupID[, callback])
+
+Returns a Facebook Group's rules (the "Group rules from the admins" list).
+
+__Arguments__
+
+* `groupID`: The ID of the Facebook Group.
+* `callback(err, rules)`: Called with an array of rules: `ruleID`, `position`, `title`, `description`.
+
+__Example__
+
+```js
+api.getGroupRules("750279539095674", (err, rules) => {
+    if(err) return console.error(err);
+    rules.forEach(rule => console.log(rule.position + ". " + rule.title));
+});
+```
+
+---------------------------------------
+
+<a name="getPostComments"></a>
+### api.getPostComments(postID[, amount][, options][, callback])
+
+Returns the comments on a Facebook post, oldest first, including replies.
+
+__Arguments__
+
+* `postID`: The ID of the post.
+* `amount`: Optional number of comments to request (default 10).
+* `options`: Optional object:
+  * `feedLocation` (default `"GROUP"`) can be set when the post is in a different surface.
+  * `cursor` continues from a previous call's `pageInfo.endCursor`.
+* `callback(err, comments, pageInfo)`: Called with an array of comments and `pageInfo` `{endCursor, hasNextPage}`. Each comment has `commentID` (numeric), `postID`, `senderID`, `senderName`, `body`, `timestamp` (milliseconds), `reactionCount`, `replyCount` and `isReply`.
+
+__Example__
+
+```js
+api.getPostComments("1608283550936249", 50, (err, comments, pageInfo) => {
+    if(err) return console.error(err);
+    comments.forEach(c => console.log(c.senderName + ": " + c.body));
+
+    if (pageInfo.hasNextPage) {
+        api.getPostComments("1608283550936249", 50, {cursor: pageInfo.endCursor}, (err2, more) => {
+            if(err2) return console.error(err2);
+            console.log("more comments:", more.length);
+        });
+    }
+});
+```
+
+---------------------------------------
+
+<a name="getPostReactions"></a>
+### api.getPostReactions(postID[, options][, callback])
+
+Returns the people who reacted to a post (the first batch, as shown in the reactions dialog).
+
+__Arguments__
+
+* `postID`: The ID of the post.
+* `options`: Optional object:
+  * `reaction`: filters by a specific reaction (`"LIKE"`, `"LOVE"`, `"HAHA"`, `"WOW"`, `"SAD"`, `"ANGRY"`, `"CARE"`).
+  * `cursor`: continues from a previous call's `pageInfo.endCursor` (used when Facebook reports `hasNextPage: true`).
+* `callback(err, users, pageInfo)`: Called with an array of `{userID, name, url, type}` and `pageInfo` `{endCursor, hasNextPage}` when Facebook provides one.
+
+---------------------------------------
+
 <a name="getThreadHistory"></a>
 ### api.getThreadHistory(threadID, amount, timestamp, callback)
 
 Takes a threadID, number of messages, a timestamp, and a callback.
 
 __note__: if you're getting a 500 error, it's possible that you're requesting too many messages. Try reducing that number and see if that works.
+
+__End-to-end encrypted chats__: Facebook does not expose a plaintext history for chats that have been moved to E2EE, so the GraphQL query returns no thread for them. In that case this method reads the account's encrypted backup when it has been restored (see [`api.restoreE2EEBackup`](#restoreE2EEBackup)): backup messages are fetched, decrypted and returned as ordinary history entries (one-to-one text messages and admin events; sender ids come from the backup's message metadata). If no backup has been restored, this method falls back to messages this library has cached locally in the E2EE device file (see `e2eeDevicePath` in [api.setOptions](#setOptions)): text sent through this library and text received and decrypted by it while the E2EE client was connected. History from before this device registered, attachments and received message reactions are not available. If the chat is E2EE and nothing is available, an error is returned instead of an empty list.
 
 __Arguments__
 * `threadID`: A threadID corresponding to the target chat
@@ -983,6 +1831,72 @@ __Arguments__
 
 ---------------------------------------
 
+<a name="inviteToGroup"></a>
+### api.inviteToGroup(groupID, userIDs[, callback])
+
+Invites users to a Facebook Group (requires admin/moderator rights, and the users must be addable — for private groups Facebook only suggests friends).
+
+__Arguments__
+
+* `groupID`: The ID of the Facebook Group.
+* `userIDs`: A user ID or an array of user IDs to invite.
+* `callback(err, result)`: Called with `{groupID, userIDs, invited: true}`.
+
+---------------------------------------
+
+<a name="joinGroup"></a>
+### api.joinGroup(groupID[, callback])
+
+Joins a Facebook Group, or sends a join request when the group is private. The result tells which happened through `joined` and `joinState` (`"MEMBER"` after a direct join, `"REQUESTED"` after a request).
+
+__Arguments__
+
+* `groupID`: The ID of the Facebook Group.
+* `callback(err, result)`: Called with `{groupID, joined, joinState}`.
+
+---------------------------------------
+
+<a name="leaveGroup"></a>
+### api.leaveGroup(groupID[, callback])
+
+Leaves a Facebook Group.
+
+__Arguments__
+
+* `groupID`: The ID of the Facebook Group.
+* `callback(err, result)`: Called with `{groupID, left: true}`.
+
+Facebook refuses to let the last remaining admin leave a group (promote another admin first), in which case the callback gets an error.
+
+---------------------------------------
+
+<a name="likePost"></a>
+### api.likePost(postID[, callback])
+
+Likes a Facebook post. Shorthand for [`api.setPostReaction`](#setPostReaction)`(postID, "LIKE")`.
+
+__Arguments__
+
+* `postID`: The ID of the post to like.
+* `callback(err, result)`: Called with `{postID, reaction}`.
+
+__Example__
+
+```js
+const fs = require("fs");
+const login = require("facebook-chat-api");
+
+login({appState: JSON.parse(fs.readFileSync('appstate.json', 'utf8'))}, (err, api) => {
+    if(err) return console.error(err);
+
+    api.likePost("1608281820936422", (err) => {
+        if(err) return console.error(err);
+    });
+});
+```
+
+---------------------------------------
+
 <a name="listen"></a>
 ### api.listen(callback)
 
@@ -1317,6 +2231,8 @@ Same as [`api.listen`](#listen) but uses MQTT to recieve data.
 Will call `callback` when a new message is received on this account.
 By default this won't receive events (joining/leaving a chat, title change etc...) but it can be activated with `api.setOptions({listenEvents: true})`.  This will by default ignore messages sent by the current account, you can enable listening to your own messages with `api.setOptions({selfListen: true})`. This returns `stopListening` that will stop the `listen` loop and is guaranteed to prevent any future calls to the callback given to `listenMqtt`. An immediate call to `stopListening` when an error occurs will prevent the listen function to continue.
 
+End-to-end encrypted direct messages are also delivered to this callback while the E2EE client is connected — either explicitly via [`api.connectE2EE`](#connectE2EE) or automatically after the first encrypted send. They arrive as ordinary `message` events, decrypted. See [api.sendMessage](#sendMessage) for details.
+
 
 __Arguments__
 
@@ -1410,6 +2326,18 @@ This function will mark all of messages in your inbox readed.
 
 ---------------------------------------
 
+<a name="markGroupVisited"></a>
+### api.markGroupVisited(groupID[, callback])
+
+Marks a Facebook Group as visited, clearing its unread badge on the groups tab.
+
+__Arguments__
+
+* `groupID`: The ID of the Facebook Group.
+* `callback(err, result)`: Called with `{groupID, visited: true}`.
+
+---------------------------------------
+
 <a name="muteThread"></a>
 ### api.muteThread(threadID, muteSeconds[, callback])
 
@@ -1438,6 +2366,32 @@ login({appState: JSON.parse(fs.readFileSync('appstate.json', 'utf8'))}, (err, ap
     });
 });
 ```
+
+---------------------------------------
+
+<a name="pinGroupPost"></a>
+### api.pinGroupPost(postID[, options][, callback])
+
+Pins a post to the top of a Facebook Group's feed. Requires admin rights.
+
+__Arguments__
+
+* `postID`: The ID of the post.
+* `options`: Optional; `authorID` is the post author's user ID (defaults to the logged-in account); see [`api.deleteGroupPost`](#deleteGroupPost).
+* `callback(err, result)`: Called with `{postID, pinned: true}`.
+
+---------------------------------------
+
+<a name="removeGroupMember"></a>
+### api.removeGroupMember(groupID, userID[, callback])
+
+Removes (and by default does not block) a member from a Facebook Group. Requires admin/moderator rights. Facebook refuses to remove the last admin.
+
+__Arguments__
+
+* `groupID`: The ID of the Facebook Group.
+* `userID`: The ID of the member to remove.
+* `callback(err, result)`: Called with `{groupID, userID, removed: true}`.
 
 ---------------------------------------
 
@@ -1481,10 +2435,64 @@ __Arguments__
 
 ---------------------------------------
 
+<a name="searchGroupMembers"></a>
+### api.searchGroupMembers(groupID, query[, amount][, callback])
+
+Searches members of a Facebook Group by name (this is the search behind the group's People tab).
+
+__Arguments__
+
+* `groupID`: The ID of the Facebook Group.
+* `query`: Search string (empty string returns the default member sample, same as [`api.getGroupMembers`](#getGroupMembers)).
+* `amount`: Optional number of results to request (default 20).
+* `callback(err, members)`: Called with an array of members in the same format as [`api.getGroupMembers`](#getGroupMembers).
+
+__Example__
+
+```js
+api.searchGroupMembers("750279539095674", "Nguyen", 20, (err, members) => {
+    if(err) return console.error(err);
+    members.forEach(m => console.log(m.userID, m.name, m.city));
+});
+```
+
+---------------------------------------
+
+<a name="searchGroupPosts"></a>
+### api.searchGroupPosts(groupID, query[, amount][, callback])
+
+Searches posts inside a Facebook Group by keyword (the group's own search box).
+
+__Arguments__
+
+* `groupID`: The ID of the Facebook Group.
+* `query`: Search string.
+* `amount`: Optional number of posts to request (default 5).
+* `callback(err, posts)`: Called with an array of posts: `postID`, `senderID`, `senderName`, `body`, `timestamp`, `url`.
+
+__Example__
+
+```js
+api.searchGroupPosts("750279539095674", "headphones", 10, (err, posts) => {
+    if(err) return console.error(err);
+    posts.forEach(p => console.log(p.postID, p.body.slice(0, 60)));
+});
+```
+
+---------------------------------------
+
 <a name="sendMessage"></a>
 ### api.sendMessage(message, threadID[, callback][, messageID])
 
 Sends the given message to the threadID.
+
+**Note:** Facebook removed the endpoint this method used to post to. Plain text messages (no attachment, url, sticker, emoji, mentions or reply) are now sent over the MQTT connection, so you must call `api.listenMqtt` first and let it connect. Group chats and legacy one-to-one chats go out over MQTT.
+
+One-to-one chats are end-to-end encrypted by default. When Facebook rejects a plaintext send to such a chat (`cutoverHandleInvalidSendToOpen`), `sendMessage` automatically retries through the built-in E2EE client (`src/e2ee`), which registers a Messenger E2EE device for the logged-in account and sends a real Signal/Noise-encrypted message. The device keys and sessions are persisted to `e2ee_device.json` in the current working directory (configurable with `e2eeDevicePath`, see [api.setOptions](#setOptions)); keep that file, deleting it registers a new E2EE device. You can also connect it ahead of time with [`api.connectE2EE`](#connectE2EE).
+
+Attachments (images, videos, audio, files) are also sent through the E2EE client on encrypted one-to-one chats: the media is encrypted with the account's media key, uploaded to Facebook's encrypted media service and referenced from the Signal message. This is limited to one attachment per message and one-to-one chats; group E2EE needs sender keys, which this library does not implement. When the E2EE client is connected, incoming encrypted attachments are delivered as `attachments` on the message object; their media is still encrypted, so download it with [`api.downloadE2EEAttachment`](#downloadE2EEAttachment).
+
+While the E2EE client is connected, incoming end-to-end encrypted direct messages are decrypted and delivered through `api.listen`/`api.listenMqtt` exactly like normal messages, with the peer's user ID as `threadID` and `senderID`. They are also cached locally (see [api.getThreadHistory](#getThreadHistory)). E2EE currently supports one-to-one text and attachments; reactions and group E2EE are not decrypted.
 
 __Arguments__
 
@@ -1504,6 +2512,8 @@ Various types of message can be sent:
 * *Mentions:* set field `mentions` to an array of objects. Objects should have the `tag` field set to the text that should be highlighted in the mention. The object should have an `id` field, where the `id` is the user id of the person being mentioned. The instance of `tag` that is highlighted is determined through indexOf, an optional `fromIndex`
 can be passed in to specify the start index to start searching for the `tag` text
 in `body` (default=0). (See below for an example.)
+
+On end-to-end encrypted one-to-one chats an attachment is sent through the E2EE client instead. Its media type is taken from the stream's path/mime type when available, otherwise sniffed from the file contents; `filename` and `mimeType` can be set explicitly on the message object to override that. `body` becomes the caption for images and videos. Only one attachment per message is supported there.
 
 Note that a message can only be a regular message (which can be empty) and optionally one of the following: a sticker, an attachment or a url.
 
@@ -1579,6 +2589,20 @@ __Arguments__
 
 ---------------------------------------
 
+<a name="setCommentReaction"></a>
+### api.setCommentReaction(postID, commentID, reaction[, callback])
+
+Sets (or removes) the logged-in account's reaction on a comment.
+
+__Arguments__
+
+* `postID`: The ID of the post the comment is on.
+* `commentID`: The numeric comment ID.
+* `reaction`: One of `"LIKE"`, `"LOVE"`, `"HAHA"`, `"WOW"`, `"SAD"`, `"ANGRY"`, `"CARE"`, the raw numeric `feedback_reaction_id`, or `null` to remove the current reaction.
+* `callback(err, result)`: Called with `{postID, commentID, reaction}`.
+
+---------------------------------------
+
 <a name="setMessageReaction"></a>
 ### api.setMessageReaction(reaction, messageID[, callback])
 
@@ -1604,6 +2628,34 @@ __Supported Emojis__
 
 ---------------------------------------
 
+<a name="setPostReaction"></a>
+### api.setPostReaction(postID, reaction[, callback])
+
+Sets (or removes) the logged-in account's reaction on a Facebook post (a post in a Facebook Group or in the feed, not a Messenger message; see [`api.setMessageReaction`](#setMessageReaction) for chats).
+
+__Arguments__
+
+* `postID`: The ID of the post to react to.
+* `reaction`: One of `"LIKE"`, `"LOVE"`, `"HAHA"`, `"WOW"`, `"SAD"`, `"ANGRY"`, `"CARE"`, the raw numeric `feedback_reaction_id`, or `null` to remove the current reaction.
+* `callback(err, result)`: Called with `{postID, reaction}`.
+
+__Example__
+
+```js
+const fs = require("fs");
+const login = require("facebook-chat-api");
+
+login({appState: JSON.parse(fs.readFileSync('appstate.json', 'utf8'))}, (err, api) => {
+    if(err) return console.error(err);
+
+    api.setPostReaction("1608281820936422", "LOVE", (err) => {
+        if(err) return console.error(err);
+    });
+});
+```
+
+---------------------------------------
+
 <a name="setOptions"></a>
 ### api.setOptions(options)
 
@@ -1623,9 +2675,12 @@ __Arguments__
     - `pageID`: (Default empty) Makes [api.listen](#listen) only receive messages through the page specified by that ID. Also makes `sendMessage` and `sendSticker` send from the page.
     - `updatePresence`: (Default `false`) Will make [api.listen](#listen) also return `presence` ([api.listen](#presence) for more details).
     - `forceLogin`: (Default `false`) Will automatically approve of any recent logins and continue with the login process.
-    - `userAgent`: (Default `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10_2) AppleWebKit/600.3.18 (KHTML, like Gecko) Version/8.0.3 Safari/600.3.18`) The desired simulated User Agent.
+    - `userAgent`: (Default `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15`) The desired simulated User Agent.
 	- `autoMarkDelivery`: (Default `true`) Will automatically mark new messages as delivered. See [api.markAsDelivered](#markAsDelivered).
 	- `autoMarkRead`: (Default `false`) Will automatically mark new messages as read/seen. See [api.markAsRead](#markAsRead).
+	- `e2eeDevicePath`: (Default `e2ee_device.json` in the current working directory) Path of the file used to persist the E2EE device keys and Signal sessions used for encrypted one-to-one chats. Keep this file across restarts; deleting it registers a new E2EE device. See [api.connectE2EE](#connectE2EE).
+	- `e2eeFrameLog`: (Default off) Path of a JSONL file to which every decrypted incoming E2EE socket frame is appended (timestamp, parsed tag/attributes, raw hex) before parsing. Debugging aid for reverse-engineering server-side E2EE traffic; see [`examples/captureE2EE.js`](examples/captureE2EE.js).
+	- `opusBitrate`: (Default `128000`) Target bitrate in bits per second for the Opus encoder used by calls with real media (`options.media`). Per-call `media.opusBitrate` wins over this. Opus caps at `510000`; the default is already transparent for speech and music.
 
 __Example__
 
@@ -1671,6 +2726,19 @@ __Arguments__
 
 ---------------------------------------
 
+<a name="unpinGroupPost"></a>
+### api.unpinGroupPost(postID[, options][, callback])
+
+Removes a post from the top of a Facebook Group's feed (the counterpart of [`api.pinGroupPost`](#pinGroupPost)).
+
+__Arguments__
+
+* `postID`: The ID of the post.
+* `options`: Optional; `authorID` is the post author's user ID (defaults to the logged-in account); see [`api.deleteGroupPost`](#deleteGroupPost).
+* `callback(err, result)`: Called with `{postID, pinned: false}`.
+
+---------------------------------------
+
 <a name="unsendMessage"></a>
 ### api.unsendMessage(messageID[, callback])
 
@@ -1682,5 +2750,47 @@ __Arguments__
 
 * `messageID`: Message ID you want to unsend.
 * `callback(err)`: A callback called when the query is done (with an error or with null).
+
+---------------------------------------
+
+<a name="updateGroup"></a>
+### api.updateGroup(groupID, settings[, callback])
+
+Updates a Facebook Group's name and/or description. Requires admin rights; pass only the fields you want to change.
+
+__Arguments__
+
+* `groupID`: The ID of the Facebook Group.
+* `settings`: Object with optional `name` and `description` strings.
+* `callback(err, result)`: Called with `{groupID, name, description}` (only the changed fields are set).
+
+__Example__
+
+```js
+api.updateGroup("1608281640936440", {description: "Group about headphones"}, (err) => {
+    if(err) return console.error(err);
+});
+```
+
+---------------------------------------
+
+<a name="updateGroupDiscoverability"></a>
+### api.updateGroupDiscoverability(groupID, discoverability[, callback])
+
+Controls whether a Facebook Group can be found in search: `"ANYONE"` (visible) or `"MEMBERS_ONLY"` (hidden). Requires admin rights. Facebook only allows changing a group's *privacy* (public/private) once the group meets its eligibility rules, which is why that part isn't exposed here.
+
+__Arguments__
+
+* `groupID`: The ID of the Facebook Group.
+* `discoverability`: `"ANYONE"` or `"MEMBERS_ONLY"`.
+* `callback(err, result)`: Called with `{groupID, discoverability}`.
+
+__Example__
+
+```js
+api.updateGroupDiscoverability("1815304706561728", "MEMBERS_ONLY", (err) => {
+    if(err) return console.error(err);
+});
+```
 
 ---------------------------------------

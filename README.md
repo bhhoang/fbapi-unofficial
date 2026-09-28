@@ -53,7 +53,11 @@ Result:
 ## Documentation
 
 * [`login`](DOCS.md#login)
+* [`api.acceptCall`](DOCS.md#acceptCall)
 * [`api.addUserToGroup`](DOCS.md#addUserToGroup)
+* [`api.approveJoinRequest`](DOCS.md#approveJoinRequest)
+* [`api.blockGroupMember`](DOCS.md#blockGroupMember)
+* [`api.call`](DOCS.md#call) (with real two-way audio through `options.media`)
 * [`api.changeAdminStatus`](DOCS.md#changeAdminStatus)
 * [`api.changeArchivedStatus`](DOCS.md#changeArchivedStatus)
 * [`api.changeBlockedStatus`](DOCS.md#changeBlockedStatus)
@@ -61,13 +65,38 @@ Result:
 * [`api.changeNickname`](DOCS.md#changeNickname)
 * [`api.changeThreadColor`](DOCS.md#changeThreadColor)
 * [`api.changeThreadEmoji`](DOCS.md#changeThreadEmoji)
+* [`api.connectCalls`](DOCS.md#connectCalls)
+* [`api.connectE2EE`](DOCS.md#connectE2EE)
+* [`api.createComment`](DOCS.md#createComment)
+* [`api.createGroup`](DOCS.md#createGroup)
+* [`api.createGroupPost`](DOCS.md#createGroupPost)
 * [`api.createPoll`](DOCS.md#createPoll)
+* [`api.declineCall`](DOCS.md#declineCall)
+* [`api.declineJoinRequest`](DOCS.md#declineJoinRequest)
+* [`api.deleteComment`](DOCS.md#deleteComment)
+* [`api.deleteGroupPost`](DOCS.md#deleteGroupPost)
 * [`api.deleteMessage`](DOCS.md#deleteMessage)
 * [`api.deleteThread`](DOCS.md#deleteThread)
+* [`api.downloadE2EEAttachment`](DOCS.md#downloadE2EEAttachment)
+* [`api.editComment`](DOCS.md#editComment)
+* [`api.editGroupPost`](DOCS.md#editGroupPost)
+* [`api.endCall`](DOCS.md#endCall)
+* [`api.followGroup`](DOCS.md#followGroup)
 * [`api.forwardAttachment`](DOCS.md#forwardAttachment)
 * [`api.getAppState`](DOCS.md#getAppState)
+* [`api.getCalls`](DOCS.md#getCalls)
 * [`api.getCurrentUserID`](DOCS.md#getCurrentUserID)
+* [`api.getFeed`](DOCS.md#getFeed)
 * [`api.getFriendsList`](DOCS.md#getFriendsList)
+* [`api.getGroupEvents`](DOCS.md#getGroupEvents)
+* [`api.getGroupFiles`](DOCS.md#getGroupFiles)
+* [`api.getGroupInfo`](DOCS.md#getGroupInfo)
+* [`api.getGroupMedia`](DOCS.md#getGroupMedia)
+* [`api.getGroupMembers`](DOCS.md#getGroupMembers)
+* [`api.getGroupPosts`](DOCS.md#getGroupPosts)
+* [`api.getGroupRules`](DOCS.md#getGroupRules)
+* [`api.getPostComments`](DOCS.md#getPostComments)
+* [`api.getPostReactions`](DOCS.md#getPostReactions)
 * [`api.getThreadHistory`](DOCS.md#getThreadHistory)
 * [`api.getThreadInfo`](DOCS.md#getThreadInfo)
 * [`api.getThreadList`](DOCS.md#getThreadList)
@@ -75,21 +104,39 @@ Result:
 * [`api.getUserID`](DOCS.md#getUserID)
 * [`api.getUserInfo`](DOCS.md#getUserInfo)
 * [`api.handleMessageRequest`](DOCS.md#handleMessageRequest)
+* [`api.inviteToGroup`](DOCS.md#inviteToGroup)
+* [`api.joinGroup`](DOCS.md#joinGroup)
+* [`api.leaveGroup`](DOCS.md#leaveGroup)
+* [`api.likePost`](DOCS.md#likePost)
 * [`api.listen`](DOCS.md#listen)
 * [`api.listenMqtt`](DOCS.md#listenMqtt)
 * [`api.logout`](DOCS.md#logout)
 * [`api.markAsRead`](DOCS.md#markAsRead)
 * [`api.markAsReadAll`](DOCS.md#markAsReadAll)
+* [`api.markGroupVisited`](DOCS.md#markGroupVisited)
 * [`api.muteThread`](DOCS.md#muteThread)
+* [`api.pinGroupPost`](DOCS.md#pinGroupPost)
+* [`api.removeGroupMember`](DOCS.md#removeGroupMember)
 * [`api.removeUserFromGroup`](DOCS.md#removeUserFromGroup)
 * [`api.resolvePhotoUrl`](DOCS.md#resolvePhotoUrl)
+* [`api.restoreE2EEBackup`](DOCS.md#restoreE2EEBackup)
 * [`api.searchForThread`](DOCS.md#searchForThread)
+* [`api.searchGroupMembers`](DOCS.md#searchGroupMembers)
+* [`api.searchMessages`](DOCS.md#searchMessages)
+* [`api.searchGroupPosts`](DOCS.md#searchGroupPosts)
 * [`api.sendMessage`](DOCS.md#sendMessage)
 * [`api.sendTypingIndicator`](DOCS.md#sendTypingIndicator)
+* [`api.setCommentReaction`](DOCS.md#setCommentReaction)
 * [`api.setMessageReaction`](DOCS.md#setMessageReaction)
 * [`api.setOptions`](DOCS.md#setOptions)
+* [`api.setPostReaction`](DOCS.md#setPostReaction)
 * [`api.setTitle`](DOCS.md#setTitle)
+* [`api.threadColors`](DOCS.md#threadColors)
+* [`api.unfollowGroup`](DOCS.md#unfollowGroup)
+* [`api.unpinGroupPost`](DOCS.md#unpinGroupPost)
 * [`api.unsendMessage`](DOCS.md#unsendMessage)
+* [`api.updateGroup`](DOCS.md#updateGroup)
+* [`api.updateGroupDiscoverability`](DOCS.md#updateGroupDiscoverability)
 
 ## Main Functionality
 
@@ -106,6 +153,8 @@ Various types of message can be sent:
 Note that a message can only be a regular message (which can be empty) and optionally one of the following: a sticker, an attachment or a url.
 
 __Tip__: to find your own ID, you can look inside the cookies. The `userID` is under the name `c_user`.
+
+__Encrypted one-to-one chats__: Facebook now end-to-end encrypts direct chats by default. `api.sendMessage` handles those automatically: after `api.listenMqtt` is connected, a plain text message to an encrypted chat is sent through the built-in E2EE (Signal + Noise) client instead of being rejected. Attachments (images, videos, audio, files) are also encrypted and uploaded through that client, one attachment per message. Incoming encrypted direct messages, including attachments, are decrypted and delivered to your `api.listenMqtt` callback like normal messages, and are cached for `api.getThreadHistory`; encrypted attachment media is downloaded and decrypted with `api.downloadE2EEAttachment`. The first encrypted send (or an explicit `api.connectE2EE`) registers this library as an E2EE device for your account and saves its keys to `e2ee_device.json` in the working directory (change it with `api.setOptions({ e2eeDevicePath: "..." })`) — keep that file between runs. One-to-one text and attachments only; group E2EE is not supported. See [`api.connectE2EE`](DOCS.md#connectE2EE).
 
 __Example (Basic Message)__
 ```js
@@ -138,24 +187,60 @@ login({email: "FB_EMAIL", password: "FB_PASSWORD"}, (err, api) => {
 ```
 
 ------------------------------------
-### Saving session.
+### Logging in with an appState (recommended)
 
-To avoid logging in every time you should save AppState (cookies etc.) to a file, then you can use it without having password in your scripts.
+> **appState is still the most reliable login method.** Email/password (or
+> user ID) login is supported: without 2FA it replays the current headerless
+> Web login (a GraphQL mutation with the password encrypted against the page's
+> public key); with a `twoFactorSecret` it uses Facebook's mobile app auth
+> endpoint, which reports the two-factor challenge explicitly and accepts the
+> generated TOTP code, so a 2FA login can complete programmatically. The web
+> form alone may trigger an interactive security check (Arkose CAPTCHA) before
+> accepting a 2FA code, which needs a browser — in that case the login fails
+> with `twoFactorRequired: true`. See [`login`](DOCS.md#login) for details.
 
-__Example__
+An appState is an array of your `facebook.com` cookies. Because you export it
+from a browser where you've already logged in (and cleared any 2FA/checkpoint),
+appState login skips the password/2FA steps entirely.
+
+You can also pass `appState` **together with** `email`/`password` to refresh the
+session on the same browser device — the device cookies are reused so Facebook
+recognizes the browser instead of flagging a new login. See
+[`login`](DOCS.md#login).
+
+**1. Export your cookies to `appstate.json`.** Log into facebook.com in a
+browser, then use a cookie-export extension to save your facebook.com cookies as
+a JSON **array**. Both cookie shapes are accepted: objects with `key` (what
+`api.getAppState()` produces) or with `name` (what most browser exporters
+produce).
+
+**2. Log in with it:**
 
 ```js
 const fs = require("fs");
 const login = require("facebook-chat-api");
 
-var credentials = {email: "FB_EMAIL", password: "FB_PASSWORD"};
+login({appState: JSON.parse(fs.readFileSync('appstate.json', 'utf8'))}, (err, api) => {
+    if(err) return console.error(err.error || err);
 
-login(credentials, (err, api) => {
-    if(err) return console.error(err);
+    // Save a refreshed appState so your session stays current for reuse.
+    fs.writeFileSync('appstate.json', JSON.stringify(api.getAppState(), null, 2));
 
-    fs.writeFileSync('appstate.json', JSON.stringify(api.getAppState()));
+    console.log("Logged in as " + api.getCurrentUserID());
 });
 ```
+
+A ready-to-run version (with self-refresh and setup notes) is in
+[`examples/loginWithAppState.js`](examples/loginWithAppState.js):
+
+```
+node examples/loginWithAppState.js [path/to/appstate.json]
+```
+
+The library validates the appState before using it and gives a clear error if
+it isn't an array, is missing required cookie fields, or is missing the
+`c_user` login cookie. An expired session surfaces as `"Not logged in."` —
+re-export a fresh appState from your browser when that happens.
 
 ------------------------------------
 

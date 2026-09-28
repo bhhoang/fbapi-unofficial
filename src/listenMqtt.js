@@ -3,7 +3,7 @@
 var utils = require("../utils");
 var log = require("npmlog");
 var mqtt = require('mqtt');
-var websocket = require('websocket-stream');
+var websocket = require('./websocket');
 
 var identity = function () {};
 
@@ -29,6 +29,8 @@ var topics = [
   "/orca_message_notifications",
   "/pp",
   "/webrtc_response",
+  // Responses to /ls_req requests (used by sendMessage).
+  "/ls_resp",
 ];
 
 function listenMqtt(defaultFuncs, api, ctx, globalCallback) {
@@ -81,6 +83,13 @@ function listenMqtt(defaultFuncs, api, ctx, globalCallback) {
   var mqttClient = ctx.mqttClient;
 
   mqttClient.on('error', function(err) {
+    // mqtt 5 also reports socket failures (ECONNRESET, ENOTFOUND, ...) here,
+    // which mqtt 3 swallowed. Those are transient: mqtt reconnects on its own,
+    // so only a refusal from the server (a CONNACK error) stops listening.
+    if (typeof err.code === "string") {
+      log.warn("listenMqtt", "Connection problem (" + err.code + "), reconnecting...");
+      return;
+    }
     log.error(err);
     mqttClient.end();
     globalCallback("Connection refused: Server unavailable", null);
@@ -500,6 +509,9 @@ module.exports = function (defaultFuncs, api, ctx) {
   var globalCallback = identity;
   return function (callback) {
     globalCallback = callback;
+    // The E2EE client (src/e2ee) emits decrypted direct messages through this
+    // callback, so they show up on the same listener as regular messages.
+    ctx.globalCallback = callback;
 
     //Reset some stuff
     ctx.lastSeqId = 0;
@@ -547,6 +559,7 @@ module.exports = function (defaultFuncs, api, ctx) {
 
     var stopListening = function () {
       globalCallback = identity;
+      ctx.globalCallback = undefined;
 
       if(ctx.mqttClient)
       {

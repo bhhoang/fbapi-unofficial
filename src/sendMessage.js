@@ -3,6 +3,15 @@
 var utils = require("../utils");
 var log = require("npmlog");
 var bluebird = require("bluebird");
+var stream = require("stream");
+var path = require("path");
+var E2EEClient = require("./e2ee/client").E2EEClient;
+var mediaLib = require("./e2ee/media");
+
+// Version of Facebook's LightSpeed client schema, sent with /ls_req requests.
+// It only appears in the web client's JS bundles ("LSVersion" module), so it
+// is hard-coded; when Facebook bumps it, sends fail with forceWebClientRefresh.
+var LS_VERSION_ID = "28546705091657348";
 
 var allowedProperties = {
   attachment: true,
@@ -11,8 +20,38 @@ var allowedProperties = {
   emoji: true,
   emojiSize: true,
   body: true,
-  mentions: true
+  mentions: true,
+  filename: true,
+  mimeType: true
 };
+
+function bufferToStream(buffer) {
+  var pass = new stream.PassThrough();
+  pass.end(buffer);
+  return pass;
+}
+
+function readAttachmentBuffer(source) {
+  if (Buffer.isBuffer(source)) return bluebird.resolve(source);
+  if (!utils.isReadableStream(source)) {
+    return bluebird.reject({
+      error:
+        "Attachment should be a readable stream and not " +
+        utils.getType(source) +
+        "."
+    });
+  }
+  return new bluebird(function(resolve, reject) {
+    var chunks = [];
+    source.on("data", function(chunk) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    });
+    source.on("end", function() {
+      resolve(Buffer.concat(chunks));
+    });
+    source.on("error", reject);
+  });
+}
 
 module.exports = function(defaultFuncs, api, ctx) {
   function uploadAttachment(attachments, callback) {
@@ -20,24 +59,36 @@ module.exports = function(defaultFuncs, api, ctx) {
 
     // create an array of promises
     for (var i = 0; i < attachments.length; i++) {
-      if (!utils.isReadableStream(attachments[i])) {
+      var item = attachments[i];
+      var partOptions = {};
+      if (
+        item &&
+        typeof item === "object" &&
+        !Buffer.isBuffer(item) &&
+        !utils.isReadableStream(item) &&
+        "value" in item
+      ) {
+        partOptions = item.options || {};
+        item = item.value;
+      }
+      if (!utils.isReadableStream(item)) {
         throw {
           error:
             "Attachment should be a readable stream and not " +
-            utils.getType(attachments[i]) +
+            utils.getType(item) +
             "."
         };
       }
 
       var form = {
-        upload_1024: attachments[i],
+        upload_1024: { value: item, options: partOptions },
         voice_clip: "true"
       };
 
       uploads.push(
         defaultFuncs
           .postFormData(
-            "https://upload.facebook.com/ajax/mercury/upload.php",
+            "https://www.facebook.com/ajax/mercury/upload.php",
             ctx.jar,
             form,
             {}
@@ -48,9 +99,19 @@ module.exports = function(defaultFuncs, api, ctx) {
               throw resData;
             }
 
+            var metadata = resData.payload && resData.payload.metadata;
+            var file = metadata && metadata[0];
+            if (!file) {
+              throw {
+                error:
+                  "Facebook did not accept the attachment upload. The file " +
+                  "may be blocked (e.g. executable/script files) or too large."
+              };
+            }
+
             // We have to return the data unformatted unless we want to change it
             // back in sendMessage.
-            return resData.payload.metadata[0];
+            return file;
           })
       );
     }
@@ -150,6 +211,24 @@ module.exports = function(defaultFuncs, api, ctx) {
               "Got error 1545012. This might mean that you're not part of the conversation " +
                 threadID
             );
+            if (
+              isSingleUser &&
+              !ctx.globalOptions.pageID &&
+              utils.getType(threadID) !== "Array"
+            ) {
+              log.info(
+                "sendMessage",
+                "Retrying thread " +
+                  threadID +
+                  " as a group chat (15-digit group ids look like user ids)."
+              );
+              var groupForm = Object.assign({}, form);
+              delete groupForm["specific_to_list[0]"];
+              delete groupForm["specific_to_list[1]"];
+              delete groupForm.other_user_fbid;
+              groupForm.thread_fbid = threadID;
+              return sendContent(groupForm, threadID, false, messageAndOTID, callback);
+            }
           }
           return callback(resData);
         }
@@ -172,7 +251,279 @@ module.exports = function(defaultFuncs, api, ctx) {
       });
   }
 
+  // Facebook removed /messaging/send/; the web client now sends messages as
+  // "LightSpeed" tasks published to /ls_req over the MQTT connection opened by
+  // listenMqtt, and gets the result back on /ls_resp. Only plain text is
+  // supported here. One-to-one chats are end-to-end encrypted by default;
+  // when Facebook rejects a plaintext send with cutoverHandleInvalidSendToOpen
+  // the message is retried through the native E2EE (Signal/Noise) client in
+  // src/e2ee, which registers its own E2EE device for the logged-in account.
+  function sendViaMqtt(body, threadID, messageAndOTID, callback) {
+    var mqttClient = ctx.mqttClient;
+    ctx.wsReqNumber = (ctx.wsReqNumber || 0) + 1;
+    var requestID = ctx.wsReqNumber;
+    threadID = threadID.toString();
+
+    var task = {
+      label: "46",
+      payload: JSON.stringify({
+        thread_id: threadID,
+        otid: messageAndOTID,
+        source: 0,
+        send_type: 1,
+        sync_group: 1,
+        text: body,
+        initiating_source: 1,
+        skip_url_preview_gen: 0
+      }),
+      queue_name: threadID,
+      task_id: 0,
+      failure_count: null
+    };
+    var request = {
+      app_id: "2220391788200892",
+      payload: JSON.stringify({
+        tasks: [task],
+        epoch_id: utils.generateOfflineThreadingID(),
+        version_id: LS_VERSION_ID,
+        data_trace_id: null
+      }),
+      request_id: requestID,
+      type: 3
+    };
+
+    var timeout = setTimeout(function() {
+      finish({ error: "sendMessage: timed out waiting for a response." });
+    }, 30000);
+
+    function finish(err, info) {
+      clearTimeout(timeout);
+      mqttClient.removeListener("message", onMessage);
+      callback(err, info);
+    }
+
+    function onMessage(topic, message) {
+      if (topic !== "/ls_resp") {
+        return;
+      }
+      var res;
+      try {
+        res = JSON.parse(message);
+      } catch (e) {
+        return;
+      }
+      if (res.request_id !== requestID) {
+        return;
+      }
+      var payload = res.payload || "";
+      var mid = /"(mid\.\$[^"]+)"/.exec(payload);
+      if (payload.indexOf("replaceOptimsiticMessage") > -1 && mid) {
+        return finish(null, {
+          threadID: threadID,
+          messageID: mid[1],
+          timestamp: Date.now()
+        });
+      }
+      // Sent when the thread has been moved to end-to-end encryption.
+      if (payload.indexOf("cutoverHandleInvalidSendToOpen") > -1) {
+        return finish({
+          error:
+            "sendMessage: this is an end-to-end encrypted chat, which this " +
+            "library can't send to.",
+          e2eeRequired: true
+        });
+      }
+      if (payload.indexOf("forceWebClientRefresh") > -1) {
+        return finish({
+          error:
+            "sendMessage: Facebook rejected the client version (" +
+            LS_VERSION_ID +
+            "); LS_VERSION_ID in src/sendMessage.js needs updating."
+        });
+      }
+      finish({ error: "sendMessage: message failed to send.", res: res });
+    }
+
+    mqttClient.on("message", onMessage);
+    mqttClient.publish(
+      "/ls_req",
+      JSON.stringify(request),
+      { qos: 1, retain: false },
+      function(err) {
+        if (err) {
+          finish({ error: "sendMessage: failed to publish request.", err: err });
+        }
+      }
+    );
+  }
+
+  function getE2EEClient() {
+    if (!ctx.e2eeClient) {
+      ctx.e2eeClient = new E2EEClient(ctx, defaultFuncs);
+    }
+    return ctx.e2eeClient;
+  }
+
+  function sendViaE2EE(body, threadID, callback) {
+    var client = getE2EEClient();
+    client.sendText(threadID, body, function(err, info) {
+      if (err) {
+        log.error("sendMessageE2EE", err);
+        return callback(err);
+      }
+      ctx.e2eeThreads = ctx.e2eeThreads || {};
+      ctx.e2eeThreads[threadID.toString()] = true;
+      callback(null, info);
+    });
+  }
+
+  function sendViaE2EEAttachment(threadID, prepared, callback) {
+    if (!prepared || prepared.buffers.length === 0) {
+      return callback({
+        error: "sendMessage: no attachment data available for an E2EE send."
+      });
+    }
+    if (prepared.buffers.length > 1) {
+      return callback({
+        error:
+          "sendMessage: E2EE attachments support one attachment per message."
+      });
+    }
+    var attachment = buildE2EEAttachment(
+      prepared.msg,
+      prepared.sources[0],
+      prepared.buffers[0]
+    );
+    var client = getE2EEClient();
+    client.sendAttachment(threadID, attachment, function(err, info) {
+      if (err) {
+        log.error("sendMessageE2EE", err);
+        var message =
+          (err && err.message) ||
+          (err && err.error) ||
+          String(err);
+        if (/No E2EE devices found/i.test(String(message))) {
+          return callback({
+            error:
+              "sendMessage: no end-to-end encryption devices were found for " +
+              "this chat. Group E2EE threads use sender keys, which this " +
+              "library does not implement, and some chats are not E2EE."
+          });
+        }
+        return callback(err);
+      }
+      ctx.e2eeThreads = ctx.e2eeThreads || {};
+      ctx.e2eeThreads[threadID.toString()] = true;
+      callback(null, info);
+    });
+  }
+
+  function isKnownE2EEThread(threadID) {
+    if (ctx.e2eeThreads && ctx.e2eeThreads[threadID.toString()]) return true;
+    return getE2EEClient().isKnownE2EEThread(threadID);
+  }
+
+  function isPlainText(form) {
+    return (
+      !form.has_attachment &&
+      !form.replied_to_message_id &&
+      !form["tags[0]"] &&
+      form["profile_xmd[0][id]"] === undefined
+    );
+  }
+
+  function isE2EEAttachment(form) {
+    return (
+      form.has_attachment &&
+      !form.url &&
+      !form.sticker &&
+      !form.replied_to_message_id &&
+      form["tags[0]"] === undefined &&
+      form["profile_xmd[0][id]"] === undefined
+    );
+  }
+
+  function looksLikeE2EEError(err) {
+    if (!err) return false;
+    var text;
+    try {
+      text = JSON.stringify(err);
+    } catch (e) {
+      text = String(err);
+    }
+    return /cutover|e2ee|end-to-end/i.test(text);
+  }
+
+  function looksLikeBlockedError(err) {
+    if (!err) return false;
+    var text;
+    try {
+      text = JSON.stringify(err);
+    } catch (e) {
+      text = String(err);
+    }
+    return /checkpoint|limit how often|try closing and re-opening|unsupportedbrowser|error":1357004/i.test(
+      text
+    );
+  }
+
+  function describeError(err) {
+    if (err == null) return "unknown error";
+    if (typeof err === "string") return err;
+    if (err.message) return err.message;
+    if (err.error) {
+      return typeof err.error === "string" ? err.error : JSON.stringify(err.error);
+    }
+    try {
+      return JSON.stringify(err);
+    } catch (e) {
+      return String(err);
+    }
+  }
+
+  function buildE2EEAttachment(msg, source, buffer) {
+    var sourceMime = source && typeof source.mimeType === "string" ? source.mimeType : null;
+    var mimeType = msg.mimeType || sourceMime || mediaLib.sniffMimeType(buffer) || "";
+    var classified = mediaLib.classifyMedia(mimeType);
+    var filename = msg.filename || null;
+    if (!filename && source && typeof source.path === "string") {
+      filename = path.basename(source.path);
+    }
+    if (!filename && classified.kind === "document") filename = "document";
+    return {
+      buffer: buffer,
+      kind: classified.kind,
+      serverMediaType: classified.serverMediaType,
+      mimetype: classified.mimetype,
+      filename: filename,
+      caption: msg.body != null && msg.body !== "" ? String(msg.body) : null
+    };
+  }
+
   function send(form, threadID, messageAndOTID, callback) {
+    if (
+      utils.getType(threadID) !== "Array" &&
+      !ctx.globalOptions.pageID &&
+      isPlainText(form)
+    ) {
+      if (isKnownE2EEThread(threadID)) {
+        return sendViaE2EE(form.body, threadID, callback);
+      }
+      if (ctx.mqttClient && ctx.mqttClient.connected) {
+        return sendViaMqtt(form.body, threadID, messageAndOTID, function(err, info) {
+          if (err && err.e2eeRequired) {
+            return sendViaE2EE(form.body, threadID, callback);
+          }
+          callback(err, info);
+        });
+      }
+      log.warn(
+        "sendMessage",
+        "No listenMqtt connection; falling back to the legacy send endpoint, " +
+          "which Facebook has removed. Call api.listenMqtt() first."
+      );
+    }
+
     // We're doing a query to this to check if the given id is the id of
     // a user or of a group chat. The form will be different depending
     // on that.
@@ -236,7 +587,7 @@ module.exports = function(defaultFuncs, api, ctx) {
     cb();
   }
 
-  function handleAttachment(msg, form, callback, cb) {
+  function handleAttachment(msg, form, callback, cb, prepared) {
     if (msg.attachment) {
       form["image_ids"] = [];
       form["gif_ids"] = [];
@@ -244,11 +595,31 @@ module.exports = function(defaultFuncs, api, ctx) {
       form["video_ids"] = [];
       form["audio_ids"] = [];
 
-      if (utils.getType(msg.attachment) !== "Array") {
-        msg.attachment = [msg.attachment];
+      var attachments = msg.attachment;
+      if (utils.getType(attachments) !== "Array") {
+        attachments = [attachments];
+      }
+      if (prepared) {
+        attachments = prepared.buffers.map(function(buffer, i) {
+          var source = prepared.sources[i];
+          var mimeType =
+            msg.mimeType ||
+            (source && typeof source.mimeType === "string" ? source.mimeType : null) ||
+            mediaLib.sniffMimeType(buffer) ||
+            "application/octet-stream";
+          var filename = msg.filename || null;
+          if (!filename && source && typeof source.path === "string") {
+            filename = path.basename(source.path);
+          }
+          if (!filename) filename = "upload" + mediaLib.mimeExtension(mimeType);
+          return {
+            value: bufferToStream(buffer),
+            options: { filename: filename, contentType: mimeType }
+          };
+        });
       }
 
-      uploadAttachment(msg.attachment, function(err, files) {
+      uploadAttachment(attachments, function(err, files) {
         if (err) {
           return callback(err);
         }
@@ -400,16 +771,98 @@ module.exports = function(defaultFuncs, api, ctx) {
       replied_to_message_id: replyToMessage
     };
 
-    handleSticker(msg, form, callback, () =>
-      handleAttachment(msg, form, callback, () =>
-        handleUrl(msg, form, callback, () =>
-          handleEmoji(msg, form, callback, () =>
-            handleMention(msg, form, callback, () =>
-              send(form, threadID, messageAndOTID, callback)
-            )
-          )
+    var canPrepareAttachment =
+      !!msg.attachment &&
+      !msg.url &&
+      !msg.sticker &&
+      threadIDType !== "Array" &&
+      !ctx.globalOptions.pageID;
+
+    function proceed(prepared, cb) {
+      handleSticker(msg, form, cb, () =>
+        handleAttachment(
+          msg,
+          form,
+          cb,
+          () =>
+            handleUrl(msg, form, cb, () =>
+              handleEmoji(msg, form, cb, () =>
+                handleMention(msg, form, cb, () =>
+                  send(form, threadID, messageAndOTID, cb)
+                )
+              )
+            ),
+          prepared
         )
-      )
-    );
+      );
+    }
+
+    if (!canPrepareAttachment) {
+      return proceed(null, callback);
+    }
+
+    var attachmentSources =
+      utils.getType(msg.attachment) === "Array"
+        ? msg.attachment
+        : [msg.attachment];
+
+    bluebird
+      .all(attachmentSources.map(readAttachmentBuffer))
+      .then(function(buffers) {
+        var prepared = { msg: msg, sources: attachmentSources, buffers: buffers };
+        var e2eeEligible =
+          threadIDType !== "Array" &&
+          !ctx.globalOptions.pageID &&
+          !msg.url &&
+          !msg.sticker &&
+          !replyToMessage &&
+          !msg.mentions &&
+          isE2EEAttachment(form);
+        if (!e2eeEligible) {
+          return proceed(prepared, callback);
+        }
+        if (isKnownE2EEThread(threadID)) {
+          return sendViaE2EEAttachment(threadID, prepared, callback);
+        }
+        var retried = false;
+        proceed(prepared, function(err, info) {
+          if (retried || info || !err) return callback(err, info);
+          retried = true;
+          if (looksLikeBlockedError(err)) {
+            log.warn(
+              "sendMessage",
+              "Facebook refused the plaintext attachment send (checkpoint or " +
+                "rate limit); not retrying over E2EE."
+            );
+            return callback(err);
+          }
+          log.warn(
+            "sendMessage",
+            "Plaintext attachment send failed" +
+              (looksLikeE2EEError(err)
+                ? " (end-to-end encrypted thread)"
+                : "") +
+              "; retrying through the E2EE client."
+          );
+          sendViaE2EEAttachment(threadID, prepared, function(e2eeErr, e2eeInfo) {
+            if (!e2eeErr) return callback(null, e2eeInfo);
+            callback({
+              error:
+                "sendMessage: attachment send failed. Plaintext: " +
+                describeError(err) +
+                ". E2EE fallback: " +
+                describeError(e2eeErr) +
+                ". Non-E2EE group threads need the plaintext path; group " +
+                "E2EE (sender keys) is not implemented.",
+              plaintextError: err,
+              e2eeError: e2eeErr
+            });
+          });
+        });
+      })
+      .catch(function(err) {
+        log.error("sendMessage", err);
+        callback(err);
+      });
   };
 };

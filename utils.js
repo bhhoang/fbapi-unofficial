@@ -1,19 +1,29 @@
 "use strict";
 
 var bluebird = require("bluebird");
-var request = bluebird.promisify(require("request").defaults({ jar: true }), {multiArgs: true});
+var http = require("./src/http");
 var stream = require("stream");
 var log = require("npmlog");
+var crypto = require("crypto");
+var https = require("https");
+var querystring = require("querystring");
+var sealedbox = require("tweetnacl-sealedbox-js");
 
 function getHeaders(url, options) {
+  options = options || {};
   var headers = {
     "Content-Type": "application/x-www-form-urlencoded",
     Referer: "https://www.facebook.com/",
-    Host: url.replace("https://", "").split("/")[0],
     Origin: "https://www.facebook.com",
     "User-Agent": options.userAgent,
     Connection: "keep-alive"
   };
+
+  if (options.headers) {
+    Object.keys(options.headers).forEach(function(name) {
+      headers[name] = options.headers[name];
+    });
+  }
 
   return headers;
 }
@@ -46,9 +56,7 @@ function get(url, jar, qs, options) {
     gzip: true
   };
 
-  return request(op).then(function(res) {
-    return res[0];
-  });
+  return http.request(op);
 }
 
 function post(url, jar, form, options) {
@@ -62,9 +70,7 @@ function post(url, jar, form, options) {
     gzip: true
   };
 
-  return request(op).then(function(res) {
-    return res[0];
-  });
+  return http.request(op);
 }
 
 function postFormData(url, jar, form, qs, options) {
@@ -81,9 +87,7 @@ function postFormData(url, jar, form, qs, options) {
     gzip: true
   };
 
-  return request(op).then(function(res) {
-    return res[0];
-  });
+  return http.request(op);
 }
 
 function padZeros(val, len) {
@@ -231,6 +235,240 @@ function generateAccessiblityCookie() {
       "hcm-ts": time
     })
   );
+}
+
+// The current homepage delivers its session cookies (datr, sb, ...) through a
+// `deferredCookies` JSON blob that the page's JavaScript writes to
+// document.cookie. Replaying them into the jar keeps the login requests
+// consistent with what a browser would send.
+function saveDeferredCookies(jar, html) {
+  var marker = '"deferredCookies":';
+  var start = html.indexOf(marker);
+  if (start === -1) return;
+
+  // Find the matching closing brace while ignoring braces inside strings.
+  start += marker.length;
+  var depth = 0;
+  var inString = false;
+  var end = -1;
+  for (var i = start; i < html.length; i++) {
+    var ch = html.charAt(i);
+    if (inString) {
+      if (ch === "\\") i++;
+      else if (ch === '"') inString = false;
+    } else if (ch === '"') {
+      inString = true;
+    } else if (ch === "{") {
+      depth++;
+    } else if (ch === "}") {
+      depth--;
+      if (depth === 0) {
+        end = i + 1;
+        break;
+      }
+    }
+  }
+  if (end === -1) return;
+
+  var cookies;
+  try {
+    cookies = JSON.parse(html.slice(start, end));
+  } catch (e) {
+    log.warn("login", "Could not parse deferred cookies: " + e.message);
+    return;
+  }
+
+  Object.keys(cookies).forEach(function(key) {
+    var c = cookies[key];
+    if (!c || c.value == undefined || !c.domain) return;
+    // `add_js_prefix` cookies are stored with a `_js_` prefix internally but
+    // their document.cookie name is the plain one (datr, sb, ...).
+    var name = key.indexOf("_js_") === 0 ? key.slice(4) : key;
+    var str = name + "=" + c.value + ";";
+    if (c.expiration_for_http) {
+      str += " expires=" + new Date(c.expiration_for_http * 1000).toUTCString() + ";";
+    }
+    str += " domain=" + c.domain + "; path=" + (c.path || "/") + ";";
+    if (c.secure) str += " secure;";
+    jar.setCookie(str, "https://www.facebook.com");
+  });
+}
+
+// Decodes the base32 secret used by authenticator apps into raw bytes.
+function base32ToBuffer(str) {
+  var alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  var cleaned = str.replace(/[\s=]/g, "").toUpperCase();
+  var value = 0;
+  var bits = 0;
+  var output = [];
+  for (var i = 0; i < cleaned.length; i++) {
+    var idx = alphabet.indexOf(cleaned.charAt(i));
+    if (idx === -1) {
+      throw new Error("Invalid base32 character in secret: " + cleaned.charAt(i));
+    }
+    value = (value << 5) | idx;
+    bits += 5;
+    if (bits >= 8) {
+      output.push((value >>> (bits - 8)) & 0xff);
+      bits -= 8;
+    }
+  }
+  return Buffer.from(output);
+}
+
+// RFC 6238 TOTP: 6 digits, 30 second period, HMAC-SHA1. `timestamp` is in
+// milliseconds and defaults to now; it exists so the algorithm can be tested.
+function generateTOTP(secret, timestamp) {
+  var key = base32ToBuffer(secret);
+  var counter = Math.floor((timestamp || Date.now()) / 1000 / 30);
+  var counterBuffer = Buffer.alloc(8);
+  counterBuffer.writeUInt32BE(Math.floor(counter / 4294967296), 0);
+  counterBuffer.writeUInt32BE(counter >>> 0, 4);
+
+  var hmac = crypto.createHmac("sha1", key).update(counterBuffer).digest();
+  var offset = hmac[hmac.length - 1] & 0x0f;
+  var code =
+    ((hmac[offset] & 0x7f) << 24) |
+    ((hmac[offset + 1] & 0xff) << 16) |
+    ((hmac[offset + 2] & 0xff) << 8) |
+    (hmac[offset + 3] & 0xff);
+
+  return ("000000" + (code % 1000000)).slice(-6);
+}
+
+// Encrypts the password the way the web login form does before submitting it
+// (#PWD_BROWSER:5:<timestamp>:<base64>): a random AES-256-GCM key is sealed to
+// Facebook's X25519 public key (libsodium sealed box) and the password itself
+// is AES-GCM encrypted with the timestamp as additional data.
+function encryptPassword(publicKey, keyId, password) {
+  if (!/^[0-9a-fA-F]{64}$/.test(publicKey)) {
+    throw new Error("Invalid password encryption public key.");
+  }
+  keyId = parseInt(keyId, 10);
+
+  var time = Math.floor(Date.now() / 1000).toString();
+  var key = crypto.randomBytes(32);
+  var iv = Buffer.alloc(12); // all zeroes, as sent by the browser
+  var cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  cipher.setAAD(Buffer.from(time, "utf8"));
+  var encryptedPassword = Buffer.concat([
+    cipher.update(password, "utf8"),
+    cipher.final()
+  ]);
+  var tag = cipher.getAuthTag();
+  var sealedKey = Buffer.from(sealedbox.seal(key, Buffer.from(publicKey, "hex")));
+
+  var sealedKeyLength = Buffer.alloc(2);
+  sealedKeyLength.writeUInt16LE(sealedKey.length, 0);
+  var buffer = Buffer.concat([
+    Buffer.from([1, keyId & 0xff]),
+    sealedKeyLength,
+    sealedKey,
+    tag,
+    encryptedPassword
+  ]);
+
+  return "#PWD_BROWSER:5:" + time + ":" + buffer.toString("base64");
+}
+
+// The mobile app logs in against a different backend than the web page. That
+// backend reports a pending two-factor challenge explicitly (error code 406
+// with a `login_first_factor` in `error_data`) and accepts the TOTP code as a
+// regular parameter, which the web login cannot do. `twoFactorContext` is the
+// `error_data` object from the 406 response. Resolves with the parsed JSON
+// response (which may itself contain an `error`).
+var MOBILE_AUTH_OAUTH = "OAuth 350685531728|62f8ce9f74b12f84c123cc23437a4a32";
+var MOBILE_AUTH_USER_AGENT =
+  "[FBAN/FB4A;FBAV/431.0.0.28.109;FBBV/531305904;FBDM/{density=2.625,width=1080,height=2340};" +
+  "FBLC/en_US;FBRV/0;FBCR/;FBMF/Google;FBBD/Google;FBPN/com.facebook.katana;FBDV/Pixel 7;" +
+  "FBSV/13;FBOP/1;FBCA/arm64-v8a:;]";
+
+function mobileAuth(email, password, twoFactorCode, twoFactorContext, device) {
+  var context = twoFactorContext || {};
+  device = device || {};
+  if (!device.adid) device.adid = crypto.randomBytes(8).toString("hex");
+  if (!device.device_id) device.device_id = getGUID();
+  if (!device.family_device_id) device.family_device_id = getGUID();
+  if (!device.secure_family_device_id) device.secure_family_device_id = getGUID();
+  if (!device.machine_id) device.machine_id = crypto.randomBytes(12).toString("hex");
+
+  var data = {
+    adid: device.adid,
+    format: "json",
+    device_id: device.device_id,
+    email: email,
+    password: password,
+    generate_analytics_claim: "1",
+    community_id: "",
+    cpl: "true",
+    family_device_id: device.family_device_id,
+    secure_family_device_id: device.secure_family_device_id,
+    sim_serials: "[\"89014103211118510720\"]",
+    credentials_type: twoFactorCode ? "two_factor" : "password",
+    fb4a_shared_phone_cpl_experiment: "fb4a_shared_phone_nonce_cpl_at_risk_v3",
+    fb4a_shared_phone_cpl_group: "enable_v3_at_risk",
+    enroll_misauth: "false",
+    generate_session_cookies: "1",
+    error_detail_type: "button_with_disabled",
+    source: "login",
+    generate_machine_id: "1",
+    jazoest: "22517",
+    meta_inf_fbmeta: "",
+    encrypted_msisdn: "",
+    locale: "en_US",
+    // When answering a 2FA challenge, reuse the machine id the server handed
+    // back with the challenge; otherwise use this device's id.
+    machine_id: twoFactorCode && context.machine_id ? context.machine_id : device.machine_id,
+    try_num: twoFactorCode ? "2" : "1"
+  };
+  if (twoFactorCode) {
+    data.twofactor_code = twoFactorCode;
+    data.first_factor = context.login_first_factor;
+    data.userid = context.uid;
+  }
+
+  return new bluebird(function(resolve, reject) {
+    var req = https.request({
+      hostname: "b-graph.facebook.com",
+      path: "/auth/login",
+      method: "POST",
+      timeout: 60000,
+      headers: {
+        "User-Agent": MOBILE_AUTH_USER_AGENT,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "X-FB-Friendly-Name": "authenticate",
+        "X-FB-Connection-Type": "WIFI",
+        "X-FB-Net-HNI": "20801",
+        "X-FB-SIM-HNI": "20801",
+        "X-FB-Connection-Bandwidth": "1597440",
+        "X-FB-Connection-Quality": "EXCELLENT",
+        "X-FB-Device-Group": "0",
+        "X-Tigon-Is-Retry": twoFactorCode ? "True" : "False",
+        Authorization: MOBILE_AUTH_OAUTH
+      }
+    }, function(res) {
+      var body = "";
+      res.on("data", function(chunk) { body += chunk; });
+      res.on("end", function() {
+        var parsed;
+        try {
+          parsed = JSON.parse(body);
+        } catch (e) {
+          return reject({ error: "Received an unexpected response from the mobile login endpoint." });
+        }
+        resolve(parsed);
+      });
+    });
+    req.on("error", function(err) {
+      reject({ error: "Mobile login request failed: " + err.message });
+    });
+    req.on("timeout", function() {
+      req.destroy();
+      reject({ error: "Mobile login request timed out." });
+    });
+    req.write(querystring.stringify(data));
+    req.end();
+  });
 }
 
 function getGUID() {
@@ -841,6 +1079,35 @@ function getFrom(str, startToken, endToken) {
   return lastHalf.substring(0, end);
 }
 
+// Facebook's persisted GraphQL queries declare feature-flag variables named
+// `__relay_internal__pv__<Flag>relayprovider`. Their values are embedded in
+// every logged-in page (in the Relay preloader payloads), so collect whatever
+// the page we happened to load declares and pass them along with GraphQL
+// requests. Values can be booleans, numbers or strings.
+function getRelayProviders(html) {
+  var providers = {};
+  if (!html) return providers;
+
+  var re = /"(__relay_internal__pv__[^"]+)":(true|false|null|-?\d+(?:\.\d+)?|"(?:[^"\\]|\\.)*")/g;
+  var match;
+  while ((match = re.exec(html))) {
+    var value = match[2];
+    if (value === "true") providers[match[1]] = true;
+    else if (value === "false") providers[match[1]] = false;
+    else if (value === "null") providers[match[1]] = null;
+    else if (value.charAt(0) === '"') {
+      try {
+        providers[match[1]] = JSON.parse(value);
+      } catch (e) {
+        providers[match[1]] = value.slice(1, -1);
+      }
+    } else {
+      providers[match[1]] = Number(value);
+    }
+  }
+  return providers;
+}
+
 function makeParsable(html) {
   let withoutForLoop = html.replace(/for\s*\(\s*;\s*;\s*\)\s*;\s*/, "");
 
@@ -890,6 +1157,11 @@ function generateTimestampRelative() {
 function makeDefaults(html, userID, ctx) {
   var reqCounter = 1;
   var fb_dtsg = getFrom(html, 'name="fb_dtsg" value="', '"');
+  // Current pages no longer have the hidden fb_dtsg input; the token is only
+  // in the DTSGInitialData module config.
+  if (!fb_dtsg) {
+    fb_dtsg = getFrom(html, '"DTSGInitialData",[],{"token":"', '"');
+  }
 
   // @Hack Ok we've done hacky things, this is definitely on top 5.
   // We totally assume the object is flat and try parsing until a }.
@@ -911,6 +1183,12 @@ function makeDefaults(html, userID, ctx) {
     ttstamp += fb_dtsg.charCodeAt(i);
   }
   var revision = getFrom(html, 'revision":', ",");
+
+  // Some modules (E2EE media uploads, GraphQL fetches) need the CSRF/session
+  // values outside of a form body, so keep them on ctx as well.
+  if (!ctx.fb_dtsg) ctx.fb_dtsg = fb_dtsg;
+  if (!ctx.ttstamp) ctx.ttstamp = ttstamp;
+  if (!ctx.clientRevision) ctx.clientRevision = revision;
 
   function mergeWithDefaults(obj) {
     // @TODO This is missing a key called __dyn.
@@ -959,7 +1237,14 @@ function makeDefaults(html, userID, ctx) {
   }
 
   function postWithDefaults(url, jar, form) {
-    return post(url, jar, mergeWithDefaults(form), ctx.globalOptions);
+    // Some endpoints (e.g. /api/graphql/) require the LSD CSRF token as a
+    // header, in addition to the usual fb_dtsg/jazoest form fields.
+    var options = ctx.lsd
+      ? Object.assign({}, ctx.globalOptions, {
+          headers: { "x-fb-lsd": ctx.lsd }
+        })
+      : ctx.globalOptions;
+    return post(url, jar, mergeWithDefaults(form), options);
   }
 
   function getWithDefaults(url, jar, qs) {
@@ -1111,11 +1396,17 @@ function saveCookies(jar) {
   return function(res) {
     var cookies = res.headers["set-cookie"] || [];
     cookies.forEach(function(c) {
-      if (c.indexOf(".facebook.com") > -1) {
+      // Facebook sends domain=.facebook.com, domain=facebook.com and
+      // domain=www.facebook.com; mirror all of them onto messenger.com.
+      if (c.indexOf("facebook.com") > -1) {
         jar.setCookie(c, "https://www.facebook.com");
       }
-      var c2 = c.replace(/domain=\.facebook\.com/, "domain=.messenger.com");
-      jar.setCookie(c2, "https://www.messenger.com");
+      var c2 = c.replace(/domain=(\.|www\.)?facebook\.com/, "domain=.messenger.com");
+      try {
+        jar.setCookie(c2, "https://www.messenger.com");
+      } catch (e) {
+        log.warn("saveCookies", "Skipping cookie not valid for messenger.com.");
+      }
     });
     return res;
   };
@@ -1250,10 +1541,13 @@ module.exports = {
   generateOfflineThreadingID,
   getGUID,
   getFrom,
+  getRelayProviders,
   makeParsable,
   arrToForm,
   getSignatureID,
-  getJar: request.jar,
+  getJar: function() {
+    return new http.Jar();
+  },
   generateTimestampRelative,
   makeDefaults,
   parseAndCheckLogin,
@@ -1275,6 +1569,10 @@ module.exports = {
   formatRead,
   generatePresence,
   generateAccessiblityCookie,
+  saveDeferredCookies,
+  generateTOTP,
+  encryptPassword,
+  mobileAuth,
   formatDate,
   decodeClientPayload,
   getAppState,

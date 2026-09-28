@@ -1,7 +1,257 @@
 "use strict";
 
+var fs = require("fs");
 var utils = require("../utils");
 var log = require("npmlog");
+
+function formatLocalHistoryMessage(threadID, entry) {
+  return {
+    type: "message",
+    attachments: [],
+    body: entry.body || "",
+    isGroup: false,
+    messageID: entry.messageID,
+    senderID: entry.senderID,
+    threadID: String(threadID),
+    timestamp: entry.timestamp,
+    mentions: {},
+    isUnread: false,
+    messageReactions: null,
+    isSponsored: false,
+    snippet: entry.body || ""
+  };
+}
+
+// End-to-end encrypted chats have no server-side plaintext history. When the
+// encrypted backup has been restored (see api.restoreE2EEBackup), history is
+// fetched from the backup and decrypted; otherwise messages this library sent
+// over E2EE from the local device store are used.
+function readBackupE2EEHistory(ctx, defaultFuncs, threadID, amount, before, callback) {
+  var storePath = ctx.globalOptions.e2eeDevicePath;
+  if (!storePath || !fs.existsSync(storePath)) return callback(null, null);
+  var data;
+  try {
+    data = JSON.parse(fs.readFileSync(storePath, "utf8"));
+  } catch (e) {
+    return callback(null, null);
+  }
+  var state = data.backup;
+  if (
+    !state ||
+    !state.deviceId ||
+    !state.mailboxRootKey ||
+    !state.ocmfClientState ||
+    !state.epochs ||
+    !state.epochs.length
+  ) {
+    return callback(null, null);
+  }
+
+  var backupLib = require("./e2ee/backup");
+  var messagesLib = require("./e2ee/messages");
+  var epochs = state.epochs.map(function(epoch) {
+    return {
+      epochId: epoch.epochId,
+      epochAnonId: epoch.epochAnonId,
+      epochRootKey: Buffer.from(epoch.epochRootKey, "base64")
+    };
+  });
+  var wanted = amount != null ? amount : 50;
+
+  // Some backup stanzas cannot be decrypted by any client (their content was
+  // sealed with a live-session key that never reaches the backup, e.g. call
+  // event logs). Widen the fetched window when a range contains no usable
+  // messages so that usable messages behind such a wall are still returned.
+  // Filtering by `before` happens locally: the server-side reference
+  // timestamp query is not reliable for backup ranges.
+  var MAX_WINDOW = 500;
+
+  function buildMessages(result, metadata) {
+    var messages = [];
+    result.encrypted_messages.forEach(function(message) {
+      var stanzas = message.protobuf_stanzas || {};
+      var metadataEntry = metadata[String(message.otid)] || null;
+      // The metadata endpoint only exposes sender ids when they are
+      // available (admin messages always have null, some regular messages
+      // are redacted); fall back to the chat peer for one-to-one threads
+      // and to the admin message's actor for events.
+      var senderID =
+        metadataEntry && metadataEntry.sender_id != null
+          ? String(metadataEntry.sender_id)
+          : String(threadID);
+      if (stanzas.top_level_protobuf) {
+        var timestampSource = stanzas.top_level_protobuf;
+        var text = null;
+        try {
+          var plaintext = messagesLib.decryptBackupMessage(message, epochs, String(threadID));
+          text = plaintext && messagesLib.extractMessageText(plaintext, String(threadID));
+        } catch (decryptError) {
+          text = null;
+        }
+        if (text == null) return;
+        messages.push({
+          type: "message",
+          attachments: [],
+          body: text,
+          isGroup: false,
+          messageID: String(message.otid),
+          senderID: senderID,
+          threadID: String(threadID),
+          timestamp:
+            timestampSource.protobuf_timestamp_ms != null
+              ? Number(timestampSource.protobuf_timestamp_ms)
+              : null,
+          mentions: {},
+          isUnread: false,
+          messageReactions: null,
+          isSponsored: false,
+          snippet: text
+        });
+        return;
+      }
+      if (stanzas.top_level_protobuf_unencrypted) {
+        var unencrypted = stanzas.top_level_protobuf_unencrypted;
+        var admin = { actorId: null, timestamp: null, text: null };
+        try {
+          admin = messagesLib.extractAdminMessage(
+            Buffer.from(unencrypted.unencrypted_protobuf, "base64")
+          );
+        } catch (adminError) {
+          admin = { actorId: null, timestamp: null, text: null };
+        }
+        messages.push({
+          type: "event",
+          messageID: String(message.otid),
+          threadID: String(threadID),
+          isGroup: false,
+          senderID: admin.actorId || senderID,
+          timestamp:
+            admin.timestamp != null
+              ? admin.timestamp
+              : unencrypted.protobuf_timestamp_ms != null
+                ? Number(unencrypted.protobuf_timestamp_ms)
+                : null,
+          eventType: "admin_message",
+          snippet: admin.text || "",
+          eventData: {},
+          author: admin.actorId || senderID,
+          logMessageType: "other",
+          logMessageData: {}
+        });
+      }
+    });
+    return messages;
+  }
+
+  function fetchWindow(size, widensLeft) {
+    var thread = {
+      threadId: String(threadID),
+      direction: "before",
+      numMessages: size
+    };
+
+    backupLib.fetchBackupMessageRanges(defaultFuncs, ctx, ctx.jar, {
+      threads: [thread],
+      deviceId: state.deviceId,
+      epochIds: state.epochs.map(function(epoch) {
+        return String(epoch.epochId);
+      }),
+      mailboxRootKey: state.mailboxRootKey,
+      ocmfClientState: state.ocmfClientState,
+      restoreType: "RANGE_QUERY_RESTORE"
+    }, function(fetchError, results) {
+      if (fetchError) return callback(fetchError, null);
+      var result = results && results[0];
+      if (!result || result.exception_string || !(result.encrypted_messages || []).length) {
+        return callback(null, null);
+      }
+      fetchBackupMessageMetadata(defaultFuncs, ctx, threadID, wanted, function(metadata) {
+        var messages = buildMessages(result, metadata);
+        if (messages.length > 0) {
+          if (before != null) {
+            messages = messages.filter(function(message) {
+              return message.timestamp == null || message.timestamp < before;
+            });
+          }
+          if (messages.length > 0) {
+            messages.sort(function(a, b) {
+              return (b.timestamp || 0) - (a.timestamp || 0);
+            });
+            return callback(null, messages.slice(0, wanted));
+          }
+        }
+        var rangeInfo = result.message_range_info;
+        var hasMore = rangeInfo && rangeInfo.has_more_before === true;
+        if (widensLeft > 0 && hasMore && size < MAX_WINDOW) {
+          return fetchWindow(Math.min(size * 2, MAX_WINDOW), widensLeft - 1);
+        }
+        callback(null, null);
+      });
+    });
+  }
+
+  var initialSize = Math.min(Math.max(wanted, 50), MAX_WINDOW);
+  fetchWindow(initialSize, 3);
+}
+
+// Per-message metadata (sender ids) for backup messages. The server omits
+// sender_id for messages sent by this account, so null means "self".
+function fetchBackupMessageMetadata(defaultFuncs, ctx, threadID, amount, callback) {
+  defaultFuncs
+    .post("https://www.facebook.com/api/graphql/", ctx.jar, {
+      doc_id: "28525853583670706",
+      variables: JSON.stringify({
+        data: {
+          act_thread_id: String(threadID),
+          direction: "BEFORE",
+          include_anonymized_messages: false,
+          reference_timestamp: null,
+          requested_messages: amount != null ? amount : 50
+        }
+      }),
+      server_timestamps: "true"
+    })
+    .then(utils.parseAndCheckLogin(ctx, defaultFuncs))
+    .then(function(response) {
+      var mailbox =
+        response &&
+        response.data &&
+        response.data.viewer &&
+        response.data.viewer.encrypted_backup &&
+        response.data.viewer.encrypted_backup.mailbox;
+      var metadata = {};
+      ((mailbox && mailbox.deanon_messages_metadata) || []).forEach(function(entry) {
+        metadata[String(entry.offline_threading_id)] = entry;
+      });
+      callback(metadata);
+    })
+    .catch(function(error) {
+      log.error("getThreadHistoryGraphQL", error);
+      callback({});
+    });
+}
+
+function readLocalE2EEHistory(ctx, threadID, amount, before) {
+  var storePath = ctx.globalOptions.e2eeDevicePath;
+  if (!storePath || !fs.existsSync(storePath)) return [];
+  var data;
+  try {
+    data = JSON.parse(fs.readFileSync(storePath, "utf8"));
+  } catch (e) {
+    return [];
+  }
+  var list = (data.e2ee_history && data.e2ee_history[String(threadID)]) || [];
+  var filtered = list.filter(function(entry) {
+    return before == null || entry.timestamp < before;
+  });
+  filtered.sort(function(a, b) {
+    return b.timestamp - a.timestamp;
+  });
+  if (amount != null) filtered = filtered.slice(0, amount);
+  return filtered.map(function(entry) {
+    return formatLocalHistoryMessage(threadID, entry);
+  });
+}
 
 function formatAttachmentsGraphQLResponse(attachment) {
   switch (attachment.__typename) {
@@ -103,7 +353,6 @@ function formatAttachmentsGraphQLResponse(attachment) {
         duration: attachment.playable_duration_in_ms,
         videoType: attachment.video_type.toLowerCase()
       };
-      break;
     case "MessageFile":
       return {
         type: "file",
@@ -617,9 +866,69 @@ module.exports = function(defaultFuncs, api, ctx) {
         }
         // This returns us an array of things. The last one is the success /
         // failure one.
-        // @TODO What do we do in this case?
-        if (resData[resData.length - 1].error_results !== 0) {
-          throw new Error("well darn there was an error_result");
+        if (
+          !Array.isArray(resData) ||
+          resData.length === 0 ||
+          !resData[resData.length - 1]
+        ) {
+          throw {
+            error: "getThreadHistory: invalid GraphQL response",
+            res: resData
+          };
+        }
+
+        var summary = resData[resData.length - 1];
+        if (summary.error_results !== 0) {
+          throw {
+            error: "getThreadHistory: Facebook returned error_results",
+            res: resData
+          };
+        }
+        if (summary.successful_results === 0) {
+          throw {
+            error: "getThreadHistory: there were no successful_results",
+            res: resData
+          };
+        }
+
+        var data = resData[0] && resData[0].o0 && resData[0].o0.data;
+        if (!data || data.message_thread == null) {
+          // The thread was not found, or Facebook moved it to end-to-end
+          // encryption after which it no longer exposes it through GraphQL.
+          return readBackupE2EEHistory(
+            ctx,
+            defaultFuncs,
+            threadID,
+            amount,
+            timestamp,
+            function(backupError, backupMessages) {
+              if (backupError) {
+                log.error("getThreadHistoryGraphQL", backupError);
+              }
+              if (backupMessages && backupMessages.length > 0) {
+                return callback(null, backupMessages);
+              }
+              var local = readLocalE2EEHistory(ctx, threadID, amount, timestamp);
+              if (local.length > 0) {
+                return callback(null, local);
+              }
+              if (timestamp != null) {
+                // Paging past the end of the backup history is not an error.
+                return callback(null, []);
+              }
+              log.error("getThreadHistoryGraphQL", {
+                error: "no message_thread in GraphQL response"
+              });
+              callback({
+                error:
+                  "getThreadHistory: no message_thread in GraphQL response. " +
+                  "The thread does not exist or is end-to-end encrypted, in " +
+                  "which case Facebook has no plaintext history for it. " +
+                  "Messages sent through this library are cached locally and " +
+                  "will appear here."
+              });
+            }
+          );
         }
 
         callback(null, formatMessagesGraphQLResponse(resData[0]));

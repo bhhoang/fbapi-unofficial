@@ -5,3 +5,11 @@ test-bot-config.json
 
 test/test-config.json
 test/test-appstate.json
+
+# E2EE device keys/sessions (contains private keys; also configurable via
+# api.setOptions({ e2eeDevicePath }))
+e2ee_device.json
+
+# Mobile login device identity (device_id/machine_id used for 2FA approvals)
+mobile_device.json
+frame_encryption.wasm

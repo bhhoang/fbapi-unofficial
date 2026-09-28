@@ -48,6 +48,12 @@ module.exports = function(defaultFuncs, api, ctx) {
       })
       .then(function() {
         ctx.loggedIn = false;
+        if (ctx.e2eeClient) {
+          ctx.e2eeClient.disconnect();
+        }
+        if (ctx.rtcClient) {
+          ctx.rtcClient.disconnect();
+        }
         log.info("logout", "Logged out successfully.");
         callback();
       })
