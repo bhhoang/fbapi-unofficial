@@ -14,7 +14,6 @@
 // stay silent (see DOCS.md#call). Pass `offerSdp` (or `answerSdp`) to supply
 // SDP from a real WebRTC stack.
 
-var mqtt = require("mqtt");
 var websocket = require("../websocket");
 var log = require("npmlog");
 var proto = require("./proto");
@@ -868,7 +867,7 @@ CallClient.prototype.ensureConnected = function(callback) {
   };
 
   var host = "wss://edge-chat.facebook.com/chat?sid=" + sessionID;
-  this.mqttClient = new mqtt.Client(function() {
+  this.mqttClient = new (require("mqtt").Client)(function() {
     return websocket(host, options.wsOptions);
   }, options);
 

@@ -1,12 +1,17 @@
 "use strict";
 
 var utils = require("./utils");
-var cheerio = require("cheerio");
 var log = require("npmlog");
 var fs = require("fs");
 
 var defaultLogRecordSize = 100;
 log.maxRecordSize = defaultLogRecordSize;
+
+// cheerio takes ~0.4s to load and only the password/approval forms need it, so
+// appState logins (the common case) never pay for it.
+function loadHTML(html) {
+  return require("cheerio").load(html);
+}
 
 function setOptions(globalOptions, options) {
   Object.keys(options).map(function(key) {
@@ -200,9 +205,23 @@ function buildAPI(globalOptions, html, jar) {
 
   var defaultFuncs = utils.makeDefaults(html, userID, ctx);
 
-  // Load all api functions in a loop
+  // Each api function is loaded the first time it's used. Requiring all of
+  // src/ (and the E2EE/call stacks behind it) up front was most of login's
+  // CPU time, and a script usually only needs a few of them. Assigning
+  // api.<name> still replaces the function, as before.
   apiFuncNames.map(function(v) {
-    api[v] = require('./src/' + v)(defaultFuncs, api, ctx);
+    Object.defineProperty(api, v, {
+      configurable: true,
+      enumerable: true,
+      get: function() {
+        var fn = require('./src/' + v)(defaultFuncs, api, ctx);
+        Object.defineProperty(api, v, {value: fn, writable: true, configurable: true, enumerable: true});
+        return fn;
+      },
+      set: function(fn) {
+        Object.defineProperty(api, v, {value: fn, writable: true, configurable: true, enumerable: true});
+      }
+    });
   });
 
   return [ctx, defaultFuncs, api];
@@ -211,7 +230,7 @@ function buildAPI(globalOptions, html, jar) {
 function makeLogin(jar, email, password, loginOptions, callback) {
   return function(res) {
     var html = res.body;
-    var $ = cheerio.load(html);
+    var $ = loadHTML(html);
     var arr = [];
 
     // This will be empty, but just to be sure we leave it
@@ -369,7 +388,7 @@ function makeLogin(jar, email, password, loginOptions, callback) {
             .then(function(res) {
               var html = res.body;
               // Make the form in advance which will contain the fb_dtsg and nh
-              var $ = cheerio.load(html);
+              var $ = loadHTML(html);
               var arr = [];
               $("form input").map(function(i, v){
                 arr.push({val: $(v).val(), name: $(v).attr("name")});
@@ -543,7 +562,7 @@ function handleLoginApproval(approvalURL, jar, email, password, loginOptions, ca
     .then(utils.saveCookies(jar))
     .then(function(res) {
       var html = res.body;
-      var $ = cheerio.load(html);
+      var $ = loadHTML(html);
       var arr = [];
       $("form input").map(function(i, v) {
         arr.push({ val: $(v).val(), name: $(v).attr("name") });
@@ -869,13 +888,15 @@ function loginHelper(appState, email, password, globalOptions, callback) {
       return res;
     })
     .then(function() {
-      var form = {
-        reason: 6
-      };
+      // Legacy presence ping. Its response is empty and nothing reads it, so
+      // send it in the background instead of adding a round trip to login.
       log.info("login", 'Request to reconnect');
-      return defaultFuncs
-        .get("https://www.facebook.com/ajax/presence/reconnect.php", ctx.jar, form)
-        .then(utils.saveCookies(ctx.jar));
+      defaultFuncs
+        .get("https://www.facebook.com/ajax/presence/reconnect.php", ctx.jar, {reason: 6})
+        .then(utils.saveCookies(ctx.jar))
+        .catch(function(err) {
+          log.verbose("login", "Presence reconnect failed: " + (err && err.message || err));
+        });
     })
     .then(function() {
       var presence = utils.generatePresence(ctx.userID);

@@ -7,7 +7,6 @@ var log = require("npmlog");
 var crypto = require("crypto");
 var https = require("https");
 var querystring = require("querystring");
-var sealedbox = require("tweetnacl-sealedbox-js");
 
 function getHeaders(url, options) {
   options = options || {};
@@ -356,6 +355,8 @@ function encryptPassword(publicKey, keyId, password) {
     cipher.final()
   ]);
   var tag = cipher.getAuthTag();
+  // Loaded here: only the password login needs it.
+  var sealedbox = require("tweetnacl-sealedbox-js");
   var sealedKey = Buffer.from(sealedbox.seal(key, Buffer.from(publicKey, "hex")));
 
   var sealedKeyLength = Buffer.alloc(2);

@@ -2,7 +2,6 @@
 "use strict";
 var utils = require("../utils");
 var log = require("npmlog");
-var mqtt = require('mqtt');
 var websocket = require('./websocket');
 
 var identity = function () {};
@@ -78,7 +77,8 @@ function listenMqtt(defaultFuncs, api, ctx, globalCallback) {
     }
   };
 
-  ctx.mqttClient = new mqtt.Client(_ => websocket(host, options.wsOptions), options);
+  // mqtt is loaded here rather than at the top so building the api stays cheap.
+  ctx.mqttClient = new (require('mqtt').Client)(_ => websocket(host, options.wsOptions), options);
 
   var mqttClient = ctx.mqttClient;
 
