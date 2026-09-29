@@ -762,10 +762,11 @@ function mobileLogin(jar, email, password, loginOptions) {
 // The homepage is a ~1 MB app shell that takes half a second or more to
 // stream, but an appState login only needs its CSRF token (fb_dtsg), which
 // this small endpoint returns in ~150 ms. The token is wrapped in the snippet
-// the page scrapers look for, and LSD and the client revision are filled in
-// from the homepage in the background (see enrichFromHomepage); requests work
-// without them in the meantime. If the endpoint doesn't answer as expected,
-// the homepage is loaded as before.
+// the page scrapers look for. The homepage's LSD and client revision aren't
+// needed (requests work without them, and relayGraphql fetches the homepage
+// itself if its tokens go stale), so it isn't loaded at all, which keeps a
+// login to one request. If the endpoint doesn't answer as expected, the
+// homepage is loaded as before.
 function fetchSessionTokens(jar, globalOptions) {
   return utils
     .get("https://www.facebook.com/ajax/dtsg/?__a=1", jar, null, globalOptions)
@@ -789,26 +790,6 @@ function fetchSessionTokens(jar, globalOptions) {
       return utils
         .get("https://www.facebook.com/", jar, null, globalOptions)
         .then(utils.saveCookies(jar));
-    });
-}
-
-function enrichFromHomepage(ctx) {
-  utils
-    .get("https://www.facebook.com/", ctx.jar, null, ctx.globalOptions)
-    .then(utils.saveCookies(ctx.jar))
-    .then(function(res) {
-      var html = String(res.body || "");
-      var lsd = utils.getFrom(html, '"LSD",[],{"token":"', '"');
-      var revision = utils.getFrom(html, 'revision":', ",");
-      var providers = utils.getRelayProviders(html);
-      if (lsd && !ctx.lsd) ctx.lsd = lsd;
-      if (revision && !ctx.clientRevision) ctx.clientRevision = revision;
-      if (Object.keys(providers).length > 0 && Object.keys(ctx.relayProviders || {}).length === 0) {
-        ctx.relayProviders = providers;
-      }
-    })
-    .catch(function(err) {
-      log.verbose("login", "Loading the homepage for LSD/revision failed: " + (err && err.message || err));
     });
 }
 
@@ -919,7 +900,6 @@ function loginHelper(appState, email, password, globalOptions, callback) {
   }
 
   var ctx = null;
-  var defaultFuncs = null;
   var api = null;
 
   mainPromise = mainPromise
@@ -938,22 +918,12 @@ function loginHelper(appState, email, password, globalOptions, callback) {
       var html = res.body;
       var stuff = buildAPI(globalOptions, html, jar);
       ctx = stuff[0];
-      defaultFuncs = stuff[1];
       api = stuff[2];
-      if (res.fastTokens) enrichFromHomepage(ctx);
       return res;
     })
-    .then(function() {
-      // Legacy presence ping. Its response is empty and nothing reads it, so
-      // send it in the background instead of adding a round trip to login.
-      log.info("login", 'Request to reconnect');
-      defaultFuncs
-        .get("https://www.facebook.com/ajax/presence/reconnect.php", ctx.jar, {reason: 6})
-        .then(utils.saveCookies(ctx.jar))
-        .catch(function(err) {
-          log.verbose("login", "Presence reconnect failed: " + (err && err.message || err));
-        });
-    })
+    // The legacy presence ping (ajax/presence/reconnect.php) that used to be
+    // sent here is gone: its reply was empty, and online status was the same
+    // with and without it (see CHANGELOG).
     .then(function() {
       var presence = utils.generatePresence(ctx.userID);
       ctx.jar.setCookie("presence=" + presence + "; path=/; domain=.facebook.com; secure", "https://www.facebook.com");

@@ -76,40 +76,32 @@ describe("login (appState)", function() {
     s = null;
   });
 
-  it("gets fb_dtsg from the small token endpoint instead of waiting for the homepage", function(done) {
-    var homeRequested = false;
-    s = stub({
-      "https://www.facebook.com/ajax/dtsg/": dtsgReply("fast-dtsg"),
-      "https://www.facebook.com/": function() {
-        homeRequested = true;
-        return new Promise(function() {}); // never answers
-      }
-    });
-    login({ appState: appState() }, { logLevel: "silent" }, guard(done, function(err, api) {
-      if (err) return done(err);
-      assert.strictEqual(api.getCurrentUserID(), "100000000000001");
-      assert.strictEqual(s.calls[0].url, DTSG);
-      assert.strictEqual(homeRequested, true, "the homepage should still be fetched, in the background");
-      firstPostAfter(s, api, done, function(post) {
-        assert.strictEqual(post.form.fb_dtsg, "fast-dtsg");
-      });
-    }));
-  });
-
-  it("fills in LSD and revision from the homepage in the background", function(done) {
+  it("gets fb_dtsg from the small token endpoint instead of the homepage", function(done) {
     s = stub({
       "https://www.facebook.com/ajax/dtsg/": dtsgReply("fast-dtsg"),
       "https://www.facebook.com/": { body: HOME_HTML }
     });
     login({ appState: appState() }, { logLevel: "silent" }, guard(done, function(err, api) {
       if (err) return done(err);
-      setTimeout(function() {
-        firstPostAfter(s, api, done, function(post) {
-          assert.strictEqual(post.headers["x-fb-lsd"], "home-lsd");
-          assert.strictEqual(String(post.form.__rev), "1234");
-          assert.strictEqual(post.form.fb_dtsg, "fast-dtsg");
-        });
-      }, 20);
+      assert.strictEqual(api.getCurrentUserID(), "100000000000001");
+      firstPostAfter(s, api, done, function(post) {
+        assert.strictEqual(post.form.fb_dtsg, "fast-dtsg");
+      });
+    }));
+  });
+
+  it("makes a single request to log in", function(done) {
+    s = stub({
+      "https://www.facebook.com/ajax/dtsg/": dtsgReply("fast-dtsg"),
+      "https://www.facebook.com/": { body: HOME_HTML }
+    });
+    login({ appState: appState() }, { logLevel: "silent" }, guard(done, function(err) {
+      if (err) return done(err);
+      // Give anything sent in the background time to show up.
+      setTimeout(guard(done, function() {
+        assert.deepStrictEqual(s.calls.map(function(c) { return c.url; }), [DTSG]);
+        done();
+      }), 50);
     }));
   });
 

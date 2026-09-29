@@ -163,7 +163,7 @@ function listenMqtt(defaultFuncs, api, ctx, globalCallback, startup) {
       };
       (function () { globalCallback(null, typ); })();
     } else if (topic === "/orca_presence") {
-      if (!ctx.globalOptions.updatePresence) {
+      if (ctx.globalOptions.updatePresence) {
         for (var i in jsonMessage.list) {
           var data = jsonMessage.list[i];
           var userID = data["u"];
@@ -189,6 +189,13 @@ function listenMqtt(defaultFuncs, api, ctx, globalCallback, startup) {
 
 function parseDelta(defaultFuncs, api, ctx, globalCallback, v) {
   if(v.delta.class == "NewMessage") {
+    // Your own messages never reach the callback unless selfListen is on, so
+    // skip them before looking up photo URLs or sending receipts for them.
+    var md = v.delta.messageMetadata;
+    if (!ctx.globalOptions.selfListen && md && md.actorFbId != null &&
+      md.actorFbId.toString() === ctx.userID) {
+      return;
+    }
     (function resolveAttachmentUrl(i) {
       // sometimes, with sticker message in group, delta does not contain 'attachments' property.
       if (v.delta.attachments && (i == v.delta.attachments.length)) {
@@ -205,7 +212,7 @@ function parseDelta(defaultFuncs, api, ctx, globalCallback, v) {
         }
         if (fmtMsg) {
           if (ctx.globalOptions.autoMarkDelivery) {
-            markDelivery(ctx, api, fmtMsg.threadID, fmtMsg.messageID);
+            markDelivery(ctx, defaultFuncs, api, fmtMsg.threadID, fmtMsg.messageID, fmtMsg.senderID);
           }
         }
         return !ctx.globalOptions.selfListen &&
@@ -360,7 +367,7 @@ function parseDelta(defaultFuncs, api, ctx, globalCallback, v) {
           }
 
           if (ctx.globalOptions.autoMarkDelivery) {
-            markDelivery(ctx, api, callbackToReturn.threadID, callbackToReturn.messageID);
+            markDelivery(ctx, defaultFuncs, api, callbackToReturn.threadID, callbackToReturn.messageID, callbackToReturn.senderID);
           }
 
           return !ctx.globalOptions.selfListen &&
@@ -497,22 +504,54 @@ function parseDelta(defaultFuncs, api, ctx, globalCallback, v) {
   }
 }
 
-function markDelivery(ctx, api, threadID, messageID) {
-  if (threadID && messageID) {
-    api.markAsDelivered(threadID, messageID, (err) => {
-      if (err) {
-        log.error(err);
-      } else {
-        if (ctx.globalOptions.autoMarkRead) {
-          api.markAsRead(threadID, (err) => {
-            if (err) {
-              log.error(err);
-            }
-          });
-        }
-      }
-    });
+// Delivery receipts (autoMarkDelivery) are collected for a moment and sent in
+// one request: the endpoint takes any number of messages, and a request per
+// message added up quickly in busy chats. Your own messages aren't receipted.
+var DELIVERY_BATCH_MS = 1000;
+
+function markDelivery(ctx, defaultFuncs, api, threadID, messageID, senderID) {
+  if (!threadID || !messageID || senderID === ctx.userID) return;
+  var pending = ctx.pendingDeliveries || (ctx.pendingDeliveries = {});
+  (pending[threadID] = pending[threadID] || []).push(messageID);
+  if (!ctx.deliveryTimer) {
+    ctx.deliveryTimer = setTimeout(function() {
+      flushDeliveries(ctx, defaultFuncs, api);
+    }, DELIVERY_BATCH_MS);
   }
+}
+
+function flushDeliveries(ctx, defaultFuncs, api) {
+  var pending = ctx.pendingDeliveries || {};
+  ctx.pendingDeliveries = {};
+  ctx.deliveryTimer = null;
+
+  var form = {};
+  var count = 0;
+  Object.keys(pending).forEach(function(threadID) {
+    pending[threadID].forEach(function(messageID, i) {
+      form["message_ids[" + count++ + "]"] = messageID;
+      form["thread_ids[" + threadID + "][" + i + "]"] = messageID;
+    });
+  });
+  if (count === 0) return;
+
+  defaultFuncs
+    .post("https://www.facebook.com/ajax/mercury/delivery_receipts.php", ctx.jar, form)
+    .then(utils.saveCookies(ctx.jar))
+    .then(utils.parseAndCheckLogin(ctx, defaultFuncs))
+    .then(function(resData) {
+      if (resData && resData.error) throw resData;
+      if (ctx.globalOptions.autoMarkRead) {
+        Object.keys(pending).forEach(function(threadID) {
+          api.markAsRead(threadID, function(err) {
+            if (err) log.error(err);
+          });
+        });
+      }
+    })
+    .catch(function(err) {
+      log.error("markAsDelivered", err);
+    });
 }
 
 module.exports = function (defaultFuncs, api, ctx) {
@@ -522,6 +561,13 @@ module.exports = function (defaultFuncs, api, ctx) {
     // The E2EE client (src/e2ee) emits decrypted direct messages through this
     // callback, so they show up on the same listener as regular messages.
     ctx.globalCallback = callback;
+
+    // Calling listenMqtt again used to leave the previous connection open (and
+    // reconnecting) next to the new one.
+    if (ctx.mqttClient) {
+      ctx.mqttClient.end(true);
+      ctx.mqttClient = undefined;
+    }
 
     //Reset some stuff
     ctx.lastSeqId = 0;
