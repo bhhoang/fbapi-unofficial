@@ -32,7 +32,10 @@ var topics = [
   "/ls_resp",
 ];
 
-function listenMqtt(defaultFuncs, api, ctx, globalCallback) {
+// `startup.seqIdReady` says whether ctx.lastSeqId has been fetched yet. The
+// connection is opened while that request is in flight, and the sync queue
+// (which needs the sequence ID) is created once both are done.
+function listenMqtt(defaultFuncs, api, ctx, globalCallback, startup) {
   var sessionID = Math.floor(Math.random() * 9007199254740991) + 1;
   var username = {
     u: ctx.userID,
@@ -97,6 +100,12 @@ function listenMqtt(defaultFuncs, api, ctx, globalCallback) {
   });
 
   mqttClient.on('connect', function() {
+    if (startup.seqIdReady) publishSyncQueue();
+  });
+
+  startup.publishSyncQueue = publishSyncQueue;
+
+  function publishSyncQueue() {
     var topic;
     var queue = {
       sync_api_version: 10,
@@ -121,7 +130,7 @@ function listenMqtt(defaultFuncs, api, ctx, globalCallback) {
     }
     
     mqttClient.publish(topic, JSON.stringify(queue), {qos: 1, retain: false});
-  });
+  }
 
   mqttClient.on('message', function(topic, message, packet) {
     var jsonMessage = JSON.parse(message);
@@ -518,6 +527,19 @@ module.exports = function (defaultFuncs, api, ctx) {
     ctx.lastSeqId = 0;
     ctx.syncToken = undefined;
 
+    // Connect right away instead of after the sequence ID request below: the
+    // two take about the same time and don't depend on each other.
+    var startup = { seqIdReady: false };
+    listenMqtt(defaultFuncs, api, ctx, globalCallback, startup);
+    var client = ctx.mqttClient;
+
+    function closeStartedClient() {
+      if (ctx.mqttClient === client) {
+        client.end(true);
+        ctx.mqttClient = undefined;
+      }
+    }
+
     //Same request as getThreadList
     const form = {
       "av": ctx.globalOptions.pageID,
@@ -556,13 +578,21 @@ module.exports = function (defaultFuncs, api, ctx) {
           throw { error: "getSeqId: there was no successful_results", res: resData };
         }
 
+        // stopListening() may have run while this request was in flight.
+        if (ctx.mqttClient !== client) return;
+
         if (resData[0].o0.data.viewer.message_threads.sync_sequence_id) {
           ctx.lastSeqId = resData[0].o0.data.viewer.message_threads.sync_sequence_id;
-          listenMqtt(defaultFuncs, api, ctx, globalCallback);
+          startup.seqIdReady = true;
+          if (client.connected) startup.publishSyncQueue();
+        } else {
+          // Without a sequence ID there is nothing to listen to (as before).
+          closeStartedClient();
         }
 
       })
       .catch((err) => {
+        closeStartedClient();
         log.error("getSeqId", err);
         return callback(err);
       });
