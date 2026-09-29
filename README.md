@@ -110,6 +110,20 @@ A message has an optional `body`, plus at most one of `sticker` (a sticker ID), 
 node examples/sendE2EE.js <userID> [path/to/appstate.json]
 ```
 
+## Speed and staying under Facebook's limits
+
+Almost all of the time a call takes is Facebook's servers answering. A few habits make the most difference:
+
+- **Connect encryption at startup.** The first encrypted message of a run has to open the E2EE connection first (about 0.3–0.8 s). Start it right after `listenMqtt` so both connect at the same time:
+
+  ```js
+  api.listenMqtt(onEvent);
+  api.connectE2EE((err) => { if (err) console.error(err); });
+  ```
+
+- **Cache device lists if you send often.** Each encrypted message looks up the recipient's devices (about 0.6 s). `api.setOptions({e2eeDeviceListCacheMs: 60000})` reuses the list for a minute, so repeat messages to the same chat take a few milliseconds. A device the recipient adds during that minute misses those messages. See [`setOptions`](DOCS.md#setOptions).
+- **Log in once and keep the process running.** Every `login()` is a new session start for Facebook, and many in a short time get the session limited: requests start coming back empty, and `listenMqtt` reports "Facebook returned an empty response". Save `api.getAppState()` after logging in and reuse it. If a process manager restarts your bot, give it a restart delay so a crash loop doesn't log in over and over.
+
 ## Calls
 
 ```js

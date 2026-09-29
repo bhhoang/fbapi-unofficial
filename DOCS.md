@@ -642,7 +642,7 @@ Opens the call-signaling connection and subscribes to Messenger's call topic. Th
 <a name="connectE2EE"></a>
 ### api.connectE2EE([callback])
 
-Connects the built-in end-to-end encryption client. This is normally done automatically by [`api.sendMessage`](#sendMessage) the first time it sends to an encrypted one-to-one chat; calling it explicitly just connects ahead of time (for example to avoid the extra startup delay on the first send).
+Connects the built-in end-to-end encryption client. This is normally done automatically by [`api.sendMessage`](#sendMessage) the first time it sends to an encrypted one-to-one chat; calling it explicitly just connects ahead of time, so the first encrypted message doesn't wait for the connection (about 0.3–0.8 s). Calling it right after [`api.listenMqtt`](#listenMqtt) lets both connect at the same time.
 
 `connectE2EE` fetches a Crypto Auth Token, registers this library as an E2EE device for the logged-in account the first time it runs (stored in the device file, see `e2eeDevicePath` in [api.setOptions](#setOptions)), opens the encrypted Noise/WebSocket connection Messenger's E2EE clients use, and uploads one-time prekeys. It is idempotent: calling it again while connected is a no-op.
 
