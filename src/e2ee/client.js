@@ -555,6 +555,46 @@ E2EEClient.prototype.getDeviceList = function(userJids) {
   });
 };
 
+// Optional cache of users' device lists (globalOptions.e2eeDeviceListCacheMs).
+// Fetching the list is a server round trip on every encrypted send. Caching
+// it makes repeat sends much faster, but a device the recipient adds while
+// its list is cached won't get those messages, so it is off by default.
+function deviceListKey(jid) {
+  var parsed = signal.parseJid(jid);
+  return parsed.user + "@" + parsed.server;
+}
+
+E2EEClient.prototype.getDeviceListCached = function(userJids) {
+  var self = this;
+  var ttl = Number(this.ctx.globalOptions && this.ctx.globalOptions.e2eeDeviceListCacheMs) || 0;
+  if (ttl <= 0) return this.getDeviceList(userJids);
+  this.deviceListCache = this.deviceListCache || {};
+  var now = Date.now();
+  var cached = [];
+  var missing = [];
+  userJids.forEach(function(jid) {
+    var entry = self.deviceListCache[deviceListKey(jid)];
+    if (entry && now - entry.at < ttl) cached = cached.concat(entry.devices);
+    else missing.push(jid);
+  });
+  if (missing.length === 0) return Promise.resolve(cached);
+  return this.getDeviceList(missing).then(function(devices) {
+    var at = Date.now();
+    missing.forEach(function(jid) {
+      var key = deviceListKey(jid);
+      self.deviceListCache[key] = {
+        at: at,
+        devices: devices.filter(function(device) { return deviceListKey(device) === key; })
+      };
+    });
+    return cached.concat(devices);
+  });
+};
+
+E2EEClient.prototype.forgetDeviceList = function(jid) {
+  if (this.deviceListCache) delete this.deviceListCache[deviceListKey(jid)];
+};
+
 E2EEClient.prototype.getPreKeyBundle = function(jid) {
   var id = this.nextId("pkb-");
   var iq = {
@@ -932,6 +972,9 @@ E2EEClient.prototype.handleNotification = function(node) {
       delete this.store.sessions[signal.addressKey(node.attrs.from)];
       this.store.save();
     }
+  } else if (type === "devices" && node.attrs.from) {
+    // A user's device list changed; don't send from a cached copy of it.
+    this.forgetDeviceList(node.attrs.from);
   }
   this.sendAck(node);
 };
@@ -1339,7 +1382,7 @@ E2EEClient.prototype._sendMessageApp = function(threadId, consumerApp, nodeType,
     createdAt: Date.now()
   };
 
-  return this.getDeviceList([toJid, selfBare]).then(function(deviceJids) {
+  return this.getDeviceListCached([toJid, selfBare]).then(function(deviceJids) {
     var seen = {};
     var unique = [];
     deviceJids.forEach(function(jid) {
@@ -1412,6 +1455,11 @@ E2EEClient.prototype._sendMessageApp = function(threadId, consumerApp, nodeType,
         return { threadID: String(threadId), messageID: messageId, timestamp: timestamp };
       });
     });
+  }).catch(function(err) {
+    // Don't keep sending from a device list that may be why this failed.
+    self.forgetDeviceList(toJid);
+    self.forgetDeviceList(selfBare);
+    throw err;
   });
 };
 

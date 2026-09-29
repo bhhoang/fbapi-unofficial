@@ -54,6 +54,11 @@ function setOptions(globalOptions, options) {
       case 'e2eeFrameLog':
         globalOptions.e2eeFrameLog = options.e2eeFrameLog;
         break;
+      case 'e2eeDeviceListCacheMs':
+        // How long an encrypted send may reuse a user's device list; 0 (the
+        // default) asks the server every time. See src/e2ee/client.js.
+        globalOptions.e2eeDeviceListCacheMs = options.e2eeDeviceListCacheMs;
+        break;
       case 'frameEncryptionWasmPath':
         globalOptions.frameEncryptionWasmPath = options.frameEncryptionWasmPath;
         break;
