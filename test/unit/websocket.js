@@ -90,6 +90,48 @@ describe("src/websocket", function() {
     });
   });
 
+  it("backs off between reconnect attempts and resets once connected", function(done) {
+    var attempts = [];
+    var dropping = new WebSocket.Server({ port: 0, host: "127.0.0.1" }, function() {
+      var dropUrl = "ws://127.0.0.1:" + dropping.address().port + "/chat";
+      var client = new mqtt.Client(function() {
+        return websocket.mqtt(dropUrl, {});
+      }, { clientId: "backoff", protocolId: "MQIsdp", protocolVersion: 3, reconnectPeriod: 40 });
+      websocket.mqttReconnectBackoff(client, { min: 40, max: 160 });
+      client.on("error", function() {});
+      dropping.on("connection", function(socket) {
+        attempts.push(Date.now());
+        socket.terminate();
+        if (attempts.length < 6) return;
+        client.end(true);
+        dropping.close();
+        var gaps = attempts.slice(1).map(function(t, i) { return t - attempts[i]; });
+        try {
+          // 40, 80, 160, 160, 160 (plus connection time).
+          assert(gaps[1] >= 70, "second gap " + gaps[1]);
+          assert(gaps[2] >= 140, "third gap " + gaps[2]);
+          assert(gaps[4] < 400, "capped gap " + gaps[4]);
+          assert.strictEqual(client.options.reconnectPeriod, 160);
+        } catch (err) {
+          return done(err);
+        }
+        // A successful connection resets the delay.
+        var good = new mqtt.Client(function() {
+          return websocket.mqtt(url, {});
+        }, { clientId: "backoff2", protocolId: "MQIsdp", protocolVersion: 3, reconnectPeriod: 40 });
+        websocket.mqttReconnectBackoff(good, { min: 40, max: 160 });
+        good.options.reconnectPeriod = 160;
+        good.on("connect", function() {
+          setImmediate(function() {
+            var period = good.options.reconnectPeriod;
+            good.end(true);
+            done(period === 40 ? null : new Error("reconnectPeriod after connect: " + period));
+          });
+        });
+      });
+    });
+  });
+
   it("accepts Facebook's acks with reserved header flags set", function(done) {
     var client = new mqtt.Client(function() {
       return websocket.mqtt(url, { headers: { Cookie: "a=1" } });

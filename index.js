@@ -759,6 +759,59 @@ function mobileLogin(jar, email, password, loginOptions) {
 }
 
 // Helps the login
+// The homepage is a ~1 MB app shell that takes half a second or more to
+// stream, but an appState login only needs its CSRF token (fb_dtsg), which
+// this small endpoint returns in ~150 ms. The token is wrapped in the snippet
+// the page scrapers look for, and LSD and the client revision are filled in
+// from the homepage in the background (see enrichFromHomepage); requests work
+// without them in the meantime. If the endpoint doesn't answer as expected,
+// the homepage is loaded as before.
+function fetchSessionTokens(jar, globalOptions) {
+  return utils
+    .get("https://www.facebook.com/ajax/dtsg/?__a=1", jar, null, globalOptions)
+    .then(utils.saveCookies(jar))
+    .then(function(res) {
+      var token = null;
+      try {
+        var data = JSON.parse(String(res.body).replace(/^for \(;;\);/, ""));
+        token = data && data.payload && data.payload.token;
+      } catch (_e) { /* handled below */ }
+      if (res.statusCode !== 200 || typeof token !== "string" || !token) {
+        throw new Error("unexpected reply from the token endpoint");
+      }
+      return {
+        body: '["DTSGInitialData",[],{"token":' + JSON.stringify(token) + '}]',
+        fastTokens: true
+      };
+    })
+    .catch(function(err) {
+      log.verbose("login", (err && err.message) + "; loading the homepage instead.");
+      return utils
+        .get("https://www.facebook.com/", jar, null, globalOptions)
+        .then(utils.saveCookies(jar));
+    });
+}
+
+function enrichFromHomepage(ctx) {
+  utils
+    .get("https://www.facebook.com/", ctx.jar, null, ctx.globalOptions)
+    .then(utils.saveCookies(ctx.jar))
+    .then(function(res) {
+      var html = String(res.body || "");
+      var lsd = utils.getFrom(html, '"LSD",[],{"token":"', '"');
+      var revision = utils.getFrom(html, 'revision":', ",");
+      var providers = utils.getRelayProviders(html);
+      if (lsd && !ctx.lsd) ctx.lsd = lsd;
+      if (revision && !ctx.clientRevision) ctx.clientRevision = revision;
+      if (Object.keys(providers).length > 0 && Object.keys(ctx.relayProviders || {}).length === 0) {
+        ctx.relayProviders = providers;
+      }
+    })
+    .catch(function(err) {
+      log.verbose("login", "Loading the homepage for LSD/revision failed: " + (err && err.message || err));
+    });
+}
+
 function loginHelper(appState, email, password, globalOptions, callback) {
   var mainPromise = null;
   var jar = utils.getJar();
@@ -846,10 +899,7 @@ function loginHelper(appState, email, password, globalOptions, callback) {
       jar.setCookie(str, "http://" + c.domain);
     });
 
-    // Load the main page.
-    mainPromise = utils
-      .get('https://www.facebook.com/', jar, null, globalOptions)
-      .then(utils.saveCookies(jar));
+    mainPromise = fetchSessionTokens(jar, globalOptions);
   } else if (globalOptions.mobileLogin) {
     // The mobile endpoint reports the two-factor challenge explicitly and
     // accepts the TOTP code, so it is used whenever one is available.
@@ -890,6 +940,7 @@ function loginHelper(appState, email, password, globalOptions, callback) {
       ctx = stuff[0];
       defaultFuncs = stuff[1];
       api = stuff[2];
+      if (res.fastTokens) enrichFromHomepage(ctx);
       return res;
     })
     .then(function() {

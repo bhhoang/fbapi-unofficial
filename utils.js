@@ -1205,7 +1205,8 @@ function makeDefaults(html, userID, ctx) {
     var newObj = {
       __user: userID,
       __req: (reqCounter++).toString(36),
-      __rev: revision,
+      // ctx.clientRevision can be filled in after login (see index.js).
+      __rev: ctx.clientRevision || revision,
       __a: 1,
       // __af: siteData.features,
       fb_dtsg: ctx.fb_dtsg ? ctx.fb_dtsg : fb_dtsg,

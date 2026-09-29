@@ -36,6 +36,24 @@ module.exports = function websocketStream(url, options) {
   return duplex;
 };
 
+// mqtt retries a dropped connection every reconnectPeriod forever, so a long
+// outage (or Facebook refusing the session) meant a new connection attempt
+// every second. This doubles the delay after each attempt, up to `max`, and
+// goes back to `min` once connected. mqtt reads options.reconnectPeriod each
+// time it schedules a retry.
+module.exports.mqttReconnectBackoff = function(client, options) {
+  var min = (options && options.min) || 1000;
+  var max = (options && options.max) || 60000;
+  client.options.reconnectPeriod = min;
+  client.on("reconnect", function() {
+    client.options.reconnectPeriod = Math.min(client.options.reconnectPeriod * 2, max);
+  });
+  client.on("connect", function() {
+    client.options.reconnectPeriod = min;
+  });
+  return client;
+};
+
 // Header flag bits each MQTT packet type must carry (publish, type 3, uses its
 // flags for dup/qos/retain and isn't listed).
 var MQTT_REQUIRED_FLAGS = {

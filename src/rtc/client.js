@@ -870,6 +870,7 @@ CallClient.prototype.ensureConnected = function(callback) {
   this.mqttClient = new (require("mqtt").Client)(function() {
     return websocket.mqtt(host, options.wsOptions);
   }, options);
+  websocket.mqttReconnectBackoff(this.mqttClient);
 
   function finish(err) {
     var callbacks = self.connectCallbacks;

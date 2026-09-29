@@ -79,6 +79,7 @@ function listenMqtt(defaultFuncs, api, ctx, globalCallback) {
 
   // mqtt is loaded here rather than at the top so building the api stays cheap.
   ctx.mqttClient = new (require('mqtt').Client)(_ => websocket.mqtt(host, options.wsOptions), options);
+  websocket.mqttReconnectBackoff(ctx.mqttClient);
 
   var mqttClient = ctx.mqttClient;
 
@@ -538,7 +539,16 @@ module.exports = function (defaultFuncs, api, ctx) {
       .post("https://www.facebook.com/api/graphqlbatch/", ctx.jar, form)
       .then(utils.parseAndCheckLogin(ctx, defaultFuncs))
       .then((resData) => {
-        if (resData && resData.length > 0 && resData[resData.length - 1].error_results > 0) {
+        if (!Array.isArray(resData) || resData.length === 0) {
+          throw {
+            error:
+              "getSeqId: Facebook returned an empty response instead of the sync " +
+              "sequence ID. This happens when Facebook limits a session, often after " +
+              "many logins in a short time. Wait a while, or log in with a fresh appState.",
+            res: resData
+          };
+        }
+        if (resData[resData.length - 1].error_results > 0) {
           throw resData[0].o0.errors;
         }
 
