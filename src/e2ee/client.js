@@ -313,6 +313,20 @@ E2EEClient.prototype.nextId = function(prefix) {
   return prefix + Date.now() + "-" + this.requestCounter;
 };
 
+// Message IDs in the format Messenger's own clients use: milliseconds since
+// the epoch shifted left 22 bits, plus 22 random bits. The server's message
+// timestamp only has one-second resolution, so recipients order messages sent
+// in the same second by this ID; random IDs made quick sends show up out of
+// order. IDs also never repeat or go backwards within one client.
+E2EEClient.prototype.nextMessageId = function() {
+  var id = (BigInt(Date.now()) << BigInt(22)) | BigInt(require("crypto").randomInt(4194304));
+  if (this.lastMessageId !== undefined && id <= this.lastMessageId) {
+    id = this.lastMessageId + BigInt(1);
+  }
+  this.lastMessageId = id;
+  return id.toString();
+};
+
 E2EEClient.prototype.cookieString = function() {
   return this.ctx.jar.getCookies("https://www.facebook.com").join("; ");
 };
@@ -1358,7 +1372,7 @@ E2EEClient.prototype._sendMessageApp = function(threadId, consumerApp, nodeType,
   var toJid = normalizeThreadJid(threadId);
   var selfJid = this.ctx.userID + "." + (store.jidDevice || 0) + "@msgr";
   var selfBare = bareJid(selfJid);
-  var messageId = String(BigInt(Math.floor(Math.random() * 1e15)));
+  var messageId = this.nextMessageId();
 
   var app = encodeMessageApplication(consumerApp);
   var devicePayload = encodeMessageTransport({ messageApp: app.messageApp });
