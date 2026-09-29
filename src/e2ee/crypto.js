@@ -6,6 +6,7 @@ var crypto = require("crypto");
 
 var SPKI_X25519 = Buffer.from("302a300506032b656e032100", "hex");
 var PKCS8_X25519 = Buffer.from("302e020100300506032b656e04220420", "hex");
+var SPKI_ED25519 = Buffer.from("302a300506032b6570032100", "hex");
 
 var B = BigInt;
 var ZERO = B(0);
@@ -72,29 +73,40 @@ function basePoint() {
 
 var BASE = basePoint();
 
-function pointAdd(a, b) {
-  if (!a) return b;
-  if (!b) return a;
-  var dyx = D * a.x * b.x * a.y * b.y;
-  var x = mod((a.x * b.y + a.y * b.x) * inv(mod(ONE + dyx)));
-  var y = mod((a.y * b.y + a.x * b.x) * inv(mod(ONE - dyx)));
-  return { x: x, y: y };
-}
-
 function pointNeg(a) {
   return { x: mod(-a.x), y: a.y };
 }
 
+// Point arithmetic in extended coordinates (X:Y:Z:T with x=X/Z, y=Y/Z,
+// T=XY/Z), so a scalar multiplication needs one modular inversion at the end
+// instead of two per addition. Affine additions made each XEdDSA signature
+// take about two seconds.
+var D2 = mod(TWO * D);
+
+function extendedAdd(p, q) {
+  var a = mod((p.Y - p.X) * (q.Y - q.X));
+  var b = mod((p.Y + p.X) * (q.Y + q.X));
+  var c = mod(p.T * D2 * q.T);
+  var d = mod(TWO * p.Z * q.Z);
+  var e = b - a;
+  var f = d - c;
+  var g = d + c;
+  var h = b + a;
+  return { X: mod(e * f), Y: mod(g * h), Z: mod(f * g), T: mod(e * h) };
+}
+
 function scalarMult(k, point) {
   var result = null;
-  var addend = point;
+  var addend = { X: point.x, Y: point.y, Z: ONE, T: mod(point.x * point.y) };
   var n = k;
   while (n > ZERO) {
-    if (n & ONE) result = pointAdd(result, addend);
-    addend = pointAdd(addend, addend);
+    if (n & ONE) result = result ? extendedAdd(result, addend) : addend;
+    addend = extendedAdd(addend, addend);
     n >>= ONE;
   }
-  return result;
+  if (!result) return null;
+  var zInv = inv(result.Z);
+  return { x: mod(result.X * zInv), y: mod(result.Y * zInv) };
 }
 
 function encodePoint(point) {
@@ -103,32 +115,12 @@ function encodePoint(point) {
   return out;
 }
 
-function decodePoint(buf) {
-  if (buf.length !== 32) return null;
-  var y = bytesToBigIntLE(buf) & MASK_255;
-  if (y >= P) return null;
-  var x2 = mod((y * y - ONE) * inv(D * y * y + ONE));
-  var x = sqrtRatio(x2);
-  if (mod(x * x) !== x2) return null;
-  if (Boolean(x & ONE) !== Boolean(buf[31] & 0x80)) x = P - x;
-  return { x: x, y: y };
-}
-
 function clampScalar(priv) {
   var out = Buffer.from(priv);
   out[0] &= 0xf8;
   out[31] &= 0x7f;
   out[31] |= 0x40;
   return out;
-}
-
-function montgomeryToEdwards(uBuf) {
-  var u = bytesToBigIntLE(uBuf) & MASK_255;
-  var y = mod((u - ONE) * inv(u + ONE));
-  var x2 = mod((y * y - ONE) * inv(D * y * y + ONE));
-  var x = sqrtRatio(x2);
-  if (x & ONE) x = P - x;
-  return { x: x, y: y };
 }
 
 function deriveEdwardsKey(priv) {
@@ -157,23 +149,26 @@ function xeddsaSign(priv, message) {
   return Buffer.concat([encodePoint(rPoint), bigIntToBytesLE(s, 32)]);
 }
 
+// XEdDSA verification is Ed25519 verification against the Edwards form of the
+// Montgomery key, with the key's sign bit carried in the signature (this is
+// how libsignal does it), so it's handed to Node's native Ed25519.
 function xeddsaVerify(pub, message, signature) {
   if (signature.length !== 64 || pub.length !== 32) return false;
   var sig = Buffer.from(signature);
-  var aEncoded = encodePoint(montgomeryToEdwards(pub));
+  var u = bytesToBigIntLE(pub) & MASK_255;
+  var aEncoded = bigIntToBytesLE(mod((u - ONE) * inv(u + ONE)), 32);
   aEncoded[31] |= sig[63] & 0x80;
   sig[63] &= 0x7f;
-  var aPoint = decodePoint(aEncoded);
-  if (!aPoint) return false;
-  var rPoint = decodePoint(sig.subarray(0, 32));
-  if (!rPoint) return false;
-  var s = bytesToBigIntLE(sig.subarray(32, 64));
-  if (s >= Q) return false;
-  var h = hashToScalar(Buffer.concat([sig.subarray(0, 32), aEncoded, message]));
-  var lhs = scalarMult(s, BASE);
-  var rhs = pointAdd(rPoint, scalarMult(h, aPoint));
-  if (!lhs || !rhs) return false;
-  return lhs.x === rhs.x && lhs.y === rhs.y;
+  try {
+    var key = crypto.createPublicKey({
+      key: Buffer.concat([SPKI_ED25519, aEncoded]),
+      format: "der",
+      type: "spki"
+    });
+    return crypto.verify(null, message, key, sig);
+  } catch (_e) {
+    return false;
+  }
 }
 
 function generateKeyPair() {

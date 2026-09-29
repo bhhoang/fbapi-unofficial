@@ -78,7 +78,7 @@ function listenMqtt(defaultFuncs, api, ctx, globalCallback) {
   };
 
   // mqtt is loaded here rather than at the top so building the api stays cheap.
-  ctx.mqttClient = new (require('mqtt').Client)(_ => websocket(host, options.wsOptions), options);
+  ctx.mqttClient = new (require('mqtt').Client)(_ => websocket.mqtt(host, options.wsOptions), options);
 
   var mqttClient = ctx.mqttClient;
 

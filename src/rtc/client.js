@@ -868,7 +868,7 @@ CallClient.prototype.ensureConnected = function(callback) {
 
   var host = "wss://edge-chat.facebook.com/chat?sid=" + sessionID;
   this.mqttClient = new (require("mqtt").Client)(function() {
-    return websocket(host, options.wsOptions);
+    return websocket.mqtt(host, options.wsOptions);
   }, options);
 
   function finish(err) {

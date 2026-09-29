@@ -564,55 +564,126 @@ E2EEClient.prototype.getPreKeyBundle = function(jid) {
   };
   return this.requestIQ(iq).then(function(res) {
     var userNode = binary.findDescendant(res, "user");
-    var keyNode = binary.findDescendant(res, "key");
     if (!userNode) {
       throw new Error("Missing user node in prekey bundle for " + jid + ": " + JSON.stringify(summarizeNode(res)));
     }
-    if (!keyNode) {
-      throw new Error("Missing key node in prekey bundle for " + jid + ": " + JSON.stringify(summarizeNode(res)));
-    }
-    var registration = binary.findChild(userNode, "registration");
-    var identity = binary.findChild(userNode, "identity");
-    var skey = binary.findChild(userNode, "skey");
-    if (!registration || !identity || !skey) {
-      throw new Error(
-        "Incomplete prekey bundle for " + jid + ": " + JSON.stringify(summarizeNode(userNode))
-      );
-    }
-    var key = binary.findChild(keyNode, "key") || keyNode;
-    var preKeyId = binary.findChild(key, "id");
-    var preKeyValue = binary.findChild(key, "value");
-    var signedId = binary.findChild(skey, "id");
-    var signedValue = binary.findChild(skey, "value");
-    var signedSig = binary.findChild(skey, "signature");
-    var readId = function(node) {
-      if (!node || !Buffer.isBuffer(node.content) || node.content.length === 0) return 0;
-      return node.content.readUIntBE(0, Math.min(node.content.length, 3));
-    };
-    var prefixed = function(node) {
-      var buf = Buffer.from(node.content);
-      return buf.length === 32 ? Buffer.concat([Buffer.from([5]), buf]) : buf;
-    };
-    var parsed = signal.parseJid(jid);
-    var bundle = {
-      registrationId: registration.content.readUInt32BE(0),
-      deviceId: parsed.device,
-      identityKey: Buffer.from(identity.content),
-      signedPreKey: {
-        keyId: readId(signedId),
-        publicKey: prefixed(signedValue),
-        signature: Buffer.from(signedSig.content)
-      }
-    };
-    if (preKeyValue && Buffer.isBuffer(preKeyValue.content)) {
-      bundle.preKey = {
-        keyId: readId(preKeyId),
-        publicKey: prefixed(preKeyValue)
-      };
-    }
-    return bundle;
+    return parsePreKeyBundle(userNode, jid, res);
   });
 };
+
+// Fetches the prekey bundles of several devices with one request, the way the
+// WhatsApp protocol allows. The server answers per-device requests one after
+// another (about a second each), so opening sessions to a contact's devices
+// one request at a time was the slowest part of a first message. Resolves to
+// {jid: bundle | Error}. Devices missing from the answer, or the whole batch
+// failing, fall back to the per-device request.
+E2EEClient.prototype.getPreKeyBundles = function(jids) {
+  var self = this;
+  if (jids.length === 1) {
+    return this.getPreKeyBundle(jids[0]).then(
+      function(bundle) { var r = {}; r[jids[0]] = bundle; return r; },
+      function(err) { var r = {}; r[jids[0]] = err; return r; }
+    );
+  }
+  var iq = {
+    tag: "iq",
+    attrs: { id: this.nextId("pkb-"), to: "s.whatsapp.net", type: "get", xmlns: "encrypt" },
+    content: [{
+      tag: "key",
+      attrs: {},
+      content: jids.map(function(jid) { return { tag: "user", attrs: { jid: jid } }; })
+    }]
+  };
+  var byAddress = {};
+  jids.forEach(function(jid) { byAddress[signal.addressKey(jid)] = jid; });
+  return this.requestIQ(iq).then(
+    function(res) {
+      var results = {};
+      collectNodes(res, "user").forEach(function(userNode) {
+        var jid = userNode.attrs && userNode.attrs.jid && byAddress[signal.addressKey(userNode.attrs.jid)];
+        if (!jid) return;
+        try {
+          results[jid] = parsePreKeyBundle(userNode, jid);
+        } catch (err) {
+          results[jid] = err;
+        }
+      });
+      return results;
+    },
+    function(err) {
+      log.verbose("e2ee", "Batched prekey fetch failed, fetching per device: " + (err && err.message));
+      return {};
+    }
+  ).then(function(results) {
+    var missing = jids.filter(function(jid) { return !results[jid]; });
+    return Promise.all(missing.map(function(jid) {
+      return self.getPreKeyBundle(jid).then(
+        function(bundle) { results[jid] = bundle; },
+        function(err) { results[jid] = err; }
+      );
+    })).then(function() { return results; });
+  });
+};
+
+function collectNodes(node, tag, out) {
+  out = out || [];
+  if (!node || typeof node !== "object") return out;
+  if (node.tag === tag) {
+    out.push(node);
+    return out;
+  }
+  if (Array.isArray(node.content)) {
+    node.content.forEach(function(child) { collectNodes(child, tag, out); });
+  }
+  return out;
+}
+
+function parsePreKeyBundle(userNode, jid, keyScope) {
+  var keyNode = binary.findDescendant(keyScope || userNode, "key");
+  if (!keyNode) {
+    throw new Error("Missing key node in prekey bundle for " + jid + ": " + JSON.stringify(summarizeNode(userNode)));
+  }
+  var registration = binary.findChild(userNode, "registration");
+  var identity = binary.findChild(userNode, "identity");
+  var skey = binary.findChild(userNode, "skey");
+  if (!registration || !identity || !skey) {
+    throw new Error(
+      "Incomplete prekey bundle for " + jid + ": " + JSON.stringify(summarizeNode(userNode))
+    );
+  }
+  var key = binary.findChild(keyNode, "key") || keyNode;
+  var preKeyId = binary.findChild(key, "id");
+  var preKeyValue = binary.findChild(key, "value");
+  var signedId = binary.findChild(skey, "id");
+  var signedValue = binary.findChild(skey, "value");
+  var signedSig = binary.findChild(skey, "signature");
+  var readId = function(node) {
+    if (!node || !Buffer.isBuffer(node.content) || node.content.length === 0) return 0;
+    return node.content.readUIntBE(0, Math.min(node.content.length, 3));
+  };
+  var prefixed = function(node) {
+    var buf = Buffer.from(node.content);
+    return buf.length === 32 ? Buffer.concat([Buffer.from([5]), buf]) : buf;
+  };
+  var parsed = signal.parseJid(jid);
+  var bundle = {
+    registrationId: registration.content.readUInt32BE(0),
+    deviceId: parsed.device,
+    identityKey: Buffer.from(identity.content),
+    signedPreKey: {
+      keyId: readId(signedId),
+      publicKey: prefixed(signedValue),
+      signature: Buffer.from(signedSig.content)
+    }
+  };
+  if (preKeyValue && Buffer.isBuffer(preKeyValue.content)) {
+    bundle.preKey = {
+      keyId: readId(preKeyId),
+      publicKey: prefixed(preKeyValue)
+    };
+  }
+  return bundle;
+}
 
 E2EEClient.prototype.getServerPreKeyCount = function() {
   var id = this.nextId("pkc-");
@@ -1171,8 +1242,10 @@ E2EEClient.prototype._connect = function() {
       ])
     );
   }).then(function() {
-    return self.syncPreKeys();
-  }).then(function() {
+    // Prekeys only matter for sessions other devices open to us, so sending
+    // doesn't wait for the count check (and a possible upload). Failures are
+    // logged inside syncPreKeys, and the heartbeat timer retries it.
+    self.syncPreKeys();
     self.startHeartbeat();
     return { userId: self.ctx.userID, deviceId: self.store.jidDevice };
   });
@@ -1279,21 +1352,21 @@ E2EEClient.prototype._sendMessageApp = function(threadId, consumerApp, nodeType,
       throw new Error("No E2EE devices found for " + threadId);
     }
     var failures = [];
-    var ensure = unique.map(function(deviceJid) {
-      if (signal.hasSession(store, deviceJid)) return Promise.resolve(deviceJid);
-      return self.getPreKeyBundle(deviceJid).then(
-        function(bundle) {
-          signal.establishSession(store, deviceJid, bundle);
-          return deviceJid;
-        },
-        function(err) {
-          failures.push(deviceJid + ": " + (err && err.message ? err.message : err));
-          return null;
-        }
-      );
+    var needSession = unique.filter(function(deviceJid) {
+      return !signal.hasSession(store, deviceJid);
     });
-    return Promise.all(ensure).then(function(usable) {
-      usable = usable.filter(Boolean);
+    var bundles = needSession.length ? self.getPreKeyBundles(needSession) : Promise.resolve({});
+    return bundles.then(function(results) {
+      var usable = unique.filter(function(deviceJid) {
+        if (needSession.indexOf(deviceJid) === -1) return true;
+        var bundle = results[deviceJid];
+        if (bundle instanceof Error || !bundle) {
+          failures.push(deviceJid + ": " + (bundle && bundle.message ? bundle.message : "no prekey bundle"));
+          return false;
+        }
+        signal.establishSession(store, deviceJid, bundle);
+        return true;
+      });
       if (usable.length === 0) {
         throw new Error(
           "Could not establish an E2EE session for " + threadId + " (" + failures.join("; ") + ")"
