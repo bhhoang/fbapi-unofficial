@@ -177,6 +177,7 @@ function buildAPI(globalOptions, html, jar) {
     'markAsDelivered',
     'markAsRead',
     'markAsReadAll',
+    'markAsUnread',
     'markGroupVisited',
     'muteThread',
     'pinGroupPost',

@@ -36,6 +36,13 @@ module.exports = function websocketStream(url, options) {
   return duplex;
 };
 
+// A plain ws WebSocket for the gateway presence client (it speaks its own
+// framed binary protocol, not MQTT). Exposed on its own so tests can point it
+// at a local server.
+module.exports.gateway = function gatewayWebSocket(url, options) {
+  return new WebSocket(url, options);
+};
+
 // mqtt retries a dropped connection every reconnectPeriod forever, so a long
 // outage (or Facebook refusing the session) meant a new connection attempt
 // every second. This doubles the delay after each attempt, up to `max`, and

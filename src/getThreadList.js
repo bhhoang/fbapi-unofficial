@@ -153,7 +153,10 @@ module.exports = function(defaultFuncs, api, ctx) {
   return function getThreadList(limit, timestamp, tags, callback) {
     if (!callback && (utils.getType(tags) === "Function" || utils.getType(tags) === "AsyncFunction")) {
       callback = tags;
-      tags = [""];
+      // The old default was [""], which the server now rejects with
+      // noncoercible_variable_value. INBOX/OTHER/PENDING are the tags the
+      // rest of the code base uses.
+      tags = ["INBOX", "OTHER", "PENDING"];
     }
     if (utils.getType(limit) !== "Number" || !Number.isInteger(limit) || limit <= 0) {
       throw {error: "getThreadList: limit must be a positive integer"};

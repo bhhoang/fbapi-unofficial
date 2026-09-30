@@ -63,6 +63,7 @@
 * [`api.markAsDelivered`](#markAsDelivered)
 * [`api.markAsRead`](#markAsRead)
 * [`api.markAsReadAll`](#markAsReadAll)
+* [`api.markAsUnread`](#markAsUnread)
 * [`api.markGroupVisited`](#markGroupVisited)
 * [`api.muteThread`](#muteThread)
 * [`api.pinGroupPost`](#pinGroupPost)
@@ -2295,6 +2296,8 @@ login({appState: JSON.parse(fs.readFileSync('appstate.json', 'utf8'))}, (err, ap
 
 Given a threadID will mark all the unread messages as read. Facebook will take a couple of seconds to show that you've read the messages.
 
+This publishes the same Lightspeed read-watermark tasks the Messenger web client sends (labels 49 and 21); the old `/ajax/mercury/change_read_status.php` endpoint no longer exists. Passing `read: false` marks the thread unread, same as [`api.markAsUnread`](#markAsUnread).
+
 You can also mark new messages as read automatically. See [api.setOptions](#setOptions).
 
 __Arguments__
@@ -2323,10 +2326,34 @@ login({appState: JSON.parse(fs.readFileSync('appstate.json', 'utf8'))}, (err, ap
 
 ---------------------------------------
 
+<a name="markAsUnread"></a>
+### api.markAsUnread(threadID[, unreadSinceMs][, callback])
+
+Marks a chat as unread, exactly the way the "Mark as unread" item in the web client does: the read watermark (Lightspeed task, label 49) is rolled back so the newest message shows as unread again.
+
+__Arguments__
+
+* `threadID` - The id of the thread to mark unread.
+* `unreadSinceMs` - Optional absolute millisecond timestamp: every message after it counts as unread. Without it the watermark is placed just before the thread's last message, so only the newest message is unread (matching what the UI does when one message arrived).
+* `callback(err, result)` - Called with `{threadID, read: false, watermarkTimestampMs}`.
+
+__Example__
+
+```js
+api.markAsUnread(message.threadID, (err, result) => {
+    if(err) return console.error(err);
+    console.log("unread again:", result);
+});
+```
+
+---------------------------------------
+
 <a name="markAsReadAll"></a>
 ### api.markAsReadAll([callback]])
 
 This function will mark all of messages in your inbox readed.
+
+It publishes the modern read-watermark tasks (the same ones [`api.markAsRead`](#markAsRead) uses) for the threads listed in the `INBOX`, `OTHER` and `PENDING` folders; the old `/ajax/mercury/mark_folder_as_read.php` endpoint is gone. The callback receives `{threads, tasks}` with how many threads were listed and tasks published.
 
 ---------------------------------------
 
@@ -2347,11 +2374,13 @@ __Arguments__
 
 Mute a chat for a period of time, or unmute a chat.
 
+This publishes the Lightspeed mute task (label 144) the web client sends; the old `/ajax/mercury/change_mute_thread.php` endpoint is gone. The task wants an absolute deadline, so `muteSeconds` is converted to `Date.now() + muteSeconds * 1000`; a value that is already an absolute millisecond timestamp (> 10^12) is passed through unchanged.
+
 __Arguments__
 
 * `threadID` - The ID of the chat you want to mute.
-* `muteSeconds` - Mute the chat for this amount of seconds. Use `0` to unmute a chat. Use '-1' to mute a chat indefinitely.
-* `callback(err)` - A callback called when the operation is done maybe with an object representing an error.
+* `muteSeconds` - Mute the chat for this amount of seconds. Use `0` to unmute a chat. Use '-1' to mute a chat indefinitely. An absolute millisecond timestamp is also accepted.
+* `callback(err, result)` - Called with `{threadID, muted, muteExpireTimeMs}`.
 
 __Example__
 
@@ -2376,12 +2405,14 @@ login({appState: JSON.parse(fs.readFileSync('appstate.json', 'utf8'))}, (err, ap
 <a name="pinGroupPost"></a>
 ### api.pinGroupPost(postID[, options][, callback])
 
-Pins a post to the top of a Facebook Group's feed. Requires admin rights.
+Pins a post to the top of a Facebook Group's feed ("Pin to Featured"). Requires admin rights.
+
+This uses the same mutation as the web client's "Pin to Featured" menu item; Facebook resolves one unrelated response field inconsistently (`field_type_no_match` on the featured-units list), which the web client ignores and this library does too.
 
 __Arguments__
 
 * `postID`: The ID of the post.
-* `options`: Optional; `authorID` is the post author's user ID (defaults to the logged-in account); see [`api.deleteGroupPost`](#deleteGroupPost).
+* `options`: Optional; `authorID` is the post author's user ID (defaults to the logged-in account), and `groupID` is the group's ID (the web client sends it with the pin); see [`api.deleteGroupPost`](#deleteGroupPost).
 * `callback(err, result)`: Called with `{postID, pinned: true}`.
 
 ---------------------------------------

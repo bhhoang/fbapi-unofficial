@@ -134,16 +134,34 @@ function refreshTokens(ctx) {
     });
 }
 
-function checkObjects(objects) {
+function checkObjects(objects, options) {
+  var tolerateFieldErrors = !!(options && options.tolerateFieldErrors);
   var critical = [];
+  var tolerated = [];
   objects.forEach(function(o) {
     if (o.error === 1357001) {
       throw { error: "Not logged in." };
     }
     (o.errors || []).forEach(function(e) {
-      if (e.severity !== "WARNING") critical.push(e);
+      if (e.severity === "WARNING") return;
+      // Facebook occasionally fails to resolve unrelated response fields
+      // (field_type_no_match) while the mutation itself is applied; the web
+      // client renders the partial response and carries on. Mutations that
+      // know this can opt in to the same behaviour.
+      if (tolerateFieldErrors && /field_type_no_match/.test(e.message || "")) {
+        tolerated.push(e);
+        return;
+      }
+      critical.push(e);
     });
   });
+  if (tolerated.length > 0) {
+    log.warn(
+      "relayGraphql",
+      "ignored " + tolerated.length + " response-field error(s): " +
+        (tolerated[0].message || "").slice(0, 120)
+    );
+  }
   if (critical.length > 0) {
     throw {
       error: critical[0].message || "relayGraphql: request failed",
@@ -185,10 +203,10 @@ module.exports = function(defaultFuncs, api, ctx) {
       });
   }
 
-  return function postGraphql(friendlyName, docId, variables) {
+  return function postGraphql(friendlyName, docId, variables, options) {
     return request(friendlyName, docId, variables)
       .then(function(objects) {
-        if (!looksEmpty(objects)) return checkObjects(objects);
+        if (!looksEmpty(objects)) return checkObjects(objects, options);
 
         // Facebook answers automated bursts with silent empty payloads instead
         // of an error; don't hammer it with a refresh+retry on every call.
@@ -196,7 +214,7 @@ module.exports = function(defaultFuncs, api, ctx) {
           ctx.relayGraphqlThrottledUntil &&
           Date.now() < ctx.relayGraphqlThrottledUntil
         ) {
-          return checkObjects(objects);
+          return checkObjects(objects, options);
         }
 
         // Tokens may have rotated; refresh and try once more.
@@ -208,7 +226,7 @@ module.exports = function(defaultFuncs, api, ctx) {
             if (looksEmpty(retryObjects)) {
               ctx.relayGraphqlThrottledUntil = Date.now() + 5 * 60 * 1000;
             }
-            return checkObjects(retryObjects);
+            return checkObjects(retryObjects, options);
           });
       })
       .catch(function(err) {

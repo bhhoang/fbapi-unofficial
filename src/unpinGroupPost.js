@@ -3,10 +3,31 @@
 var relayGraphql = require("./relayGraphql");
 var log = require("npmlog");
 
-var DOC_ID = "9573242819419742";
+var DOC_ID = "28404832819170109";
 
 function storyID(authorID, postID) {
   return Buffer.from("S:_I" + authorID + ":VK:" + postID).toString("base64");
+}
+
+function buildUnpinVariables(postID, options, userID, mutationId) {
+  options = options || {};
+  var authorID = options.authorID || userID;
+
+  return {
+    input: {
+      actor_id: String(userID),
+      client_mutation_id: String(mutationId),
+      story_id: storyID(authorID, postID)
+    },
+    feedLocation: "GROUP",
+    feedbackSource: 0,
+    focusCommentID: null,
+    scale: 3,
+    useDefaultActor: false,
+    privacySelectorRenderLocation: "COMET_STREAM",
+    referringStoryRenderLocation: null,
+    renderLocation: "group"
+  };
 }
 
 module.exports = function(defaultFuncs, api, ctx) {
@@ -22,17 +43,10 @@ module.exports = function(defaultFuncs, api, ctx) {
       }
     }
     options = options || {};
-    var authorID = options.authorID || ctx.userID;
 
-    var variables = {
-      input: {
-        actor_id: ctx.userID,
-        client_mutation_id: String(ctx.clientMutationId++),
-        story_id: storyID(authorID, postID)
-      }
-    };
+    var variables = buildUnpinVariables(postID, options, ctx.userID, ctx.clientMutationId++);
 
-    postGraphql("useGroupUnpinAnnouncementStoryMutation", DOC_ID, variables)
+    postGraphql("useGroupRemovePostFromAnnouncementsMutation", DOC_ID, variables)
       .then(function() {
         callback(null, { postID: String(postID), pinned: false });
       })
@@ -44,3 +58,4 @@ module.exports = function(defaultFuncs, api, ctx) {
 };
 
 module.exports.storyID = storyID;
+module.exports.buildUnpinVariables = buildUnpinVariables;

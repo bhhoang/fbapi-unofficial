@@ -32,6 +32,13 @@ function formatEventReminders(reminder) {
 
 function formatThreadGraphQLResponse(data) {
   var messageThread = data.o0.data.message_thread;
+  if (!messageThread) {
+    // Facebook answers a null message_thread (with a warning-level
+    // missing_required_variable_value error) for threads the legacy doc_id
+    // cannot resolve, e.g. one-to-one chats. Surface that instead of a
+    // TypeError on the next property access.
+    throw new Error("getThreadInfo: thread not found or not accessible");
+  }
   var threadID = messageThread.thread_key.thread_fbid
     ? messageThread.thread_key.thread_fbid
     : messageThread.thread_key.other_user_id;
