@@ -220,6 +220,13 @@ function generatePresence(userID) {
   );
 }
 
+// The presence cookie the web client writes: the server reads utc3 (the last
+// activity time) from it to decide whether the account is "Active now". The
+// legacy generatePresence cookie above doesn't update the active status.
+function generatePresenceCookie() {
+  return "C" + encodeURIComponent(JSON.stringify({t3: [], utc3: Date.now(), v: 1}));
+}
+
 function generateAccessiblityCookie() {
   var time = Date.now();
   return encodeURIComponent(
@@ -971,6 +978,31 @@ function getAdminTextMessageType(type) {
   }
 }
 
+// Poll deltas carry several fields as stringified JSON (the poll question,
+// the voted option ids, ...). Parse them so callers get real objects.
+function parsePollJsonField(value) {
+  if (typeof value !== "string" || !value) return value;
+  try {
+    return JSON.parse(value);
+  } catch (e) {
+    return value;
+  }
+}
+
+function parseGroupPollData(data) {
+  if (!data || typeof data !== "object") return data;
+  ["question_json", "added_option_ids", "removed_option_ids", "new_option_ids", "new_option_texts"].forEach(function(key) {
+    data[key] = parsePollJsonField(data[key]);
+  });
+  if (data.question_json && typeof data.question_json === "object") {
+    var question = data.question_json;
+    ["options", "voters", "selected_option_texts", "unselected_option_texts"].forEach(function(key) {
+      question[key] = parsePollJsonField(question[key]);
+    });
+  }
+  return data;
+}
+
 function formatDeltaEvent(m) {
   var logMessageType;
   var logMessageData;
@@ -986,6 +1018,9 @@ function formatDeltaEvent(m) {
     case "AdminTextMessage":
       logMessageData = m.untypedData;
       logMessageType = getAdminTextMessageType(m.type);
+      if (m.type === "group_poll") {
+        logMessageData = parseGroupPollData(logMessageData);
+      }
       break;
     case "ThreadName":
       logMessageType = "log:thread-name";
@@ -1570,6 +1605,7 @@ module.exports = {
   formatReadReceipt,
   formatRead,
   generatePresence,
+  generatePresenceCookie,
   generateAccessiblityCookie,
   saveDeferredCookies,
   generateTOTP,

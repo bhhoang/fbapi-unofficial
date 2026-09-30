@@ -2175,6 +2175,66 @@ The message object will contain different fields based on its type (as determine
 		<td><code>messageReply</code></td>
 		<td>An object represent a message being replied. Content inside is the same like a normal <code>"message"</code> event.</td>
 	</tr>
+	<tr>
+		<td rowspan="7">
+			<code>"message_edit"</code><br />
+			A message was edited. Facebook doesn't push the edit itself, so this is detected by refetching the last messages of the most recently active thread after a <code>NoOp</code> delta; the new body includes Facebook's <code> (edited)</code> suffix. Needs <code>api.setOptions({ listenEvents: true })</code>.
+		</td>
+		<td><code>threadID</code></td>
+		<td>The threadID representing the thread in which the message was edited.</td>
+	</tr>
+	<tr>
+		<td><code>messageID</code></td>
+		<td>A string representing the message ID that was edited.</td>
+	</tr>
+	<tr>
+		<td><code>body</code></td>
+		<td>The new body of the message.</td>
+	</tr>
+	<tr>
+		<td><code>previousBody</code></td>
+		<td>The body the message had before the edit.</td>
+	</tr>
+	<tr>
+		<td><code>senderID</code></td>
+		<td>The id of the person who sent the message.</td>
+	</tr>
+	<tr>
+		<td><code>timestamp</code></td>
+		<td>The time the original message was sent.</td>
+	</tr>
+	<tr>
+		<td><code>type</code></td>
+		<td>For this event type, this will always be the string <code>"message_edit"</code>.</td>
+	</tr>
+	<tr>
+		<td rowspan="6">
+			<code>"message_self_delete"</code><br />
+			A message was deleted for the current account only ("remove for you"), usually by the account itself. Needs <code>api.setOptions({ listenEvents: true })</code>.
+		</td>
+		<td><code>threadID</code></td>
+		<td>The threadID representing the thread in which the message was deleted.</td>
+	</tr>
+	<tr>
+		<td><code>messageID</code></td>
+		<td>A string, or an array of strings, representing the message ID(s) that were deleted.</td>
+	</tr>
+	<tr>
+		<td><code>senderID</code></td>
+		<td>The id of the account that deleted the message.</td>
+	</tr>
+	<tr>
+		<td><code>deletionTimestamp</code></td>
+		<td>The time when the request was sent.</td>
+	</tr>
+	<tr>
+		<td><code>timestamp</code></td>
+		<td>The time the deleted message was sent.</td>
+	</tr>
+	<tr>
+		<td><code>type</code></td>
+		<td>For this event type, this will always be the string <code>"message_self_delete"</code>.</td>
+	</tr>
 </table>
 
 __Attachments__
@@ -2708,7 +2768,8 @@ __Arguments__
       forever).
     - `listenEvents`: (Default `false`) Will make [api.listen](#listen) also handle events (look at api.listen for more details).
     - `pageID`: (Default empty) Makes [api.listen](#listen) only receive messages through the page specified by that ID. Also makes `sendMessage` and `sendSticker` send from the page.
-    - `updatePresence`: (Default `false`) Will make [api.listen](#listen) also return `presence` ([api.listen](#presence) for more details).
+    - `updatePresence`: (Default `false`) Will make [api.listen](#listen) and [api.listenMqtt](#listenMqtt) also return `presence` ([api.listen](#presence) for more details).
+    - `online`: (Default `true`) Keeps the account shown as online ("Active now") while [api.listenMqtt](#listenMqtt) is running, by reporting presence over Facebook's gateway the same way the web client does (`src/gatewayPresence.js`: it opens the streamcontroller socket, subscribes to `PresenceUnifiedJSON` and publishes the presence reports). Set to `false` (at login or later with `api.setOptions`) to disconnect it and let the account drop back to "Active ... ago".
     - `forceLogin`: (Default `false`) Will automatically approve of any recent logins and continue with the login process.
     - `userAgent`: (Default `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15`) The desired simulated User Agent.
 	- `autoMarkDelivery`: (Default `true`) Will automatically mark new messages as delivered. Messages that arrive within a second of each other are marked in one request, so a receipt can go out up to a second after the message arrives; your own messages aren't marked. See [api.markAsDelivered](#markAsDelivered).

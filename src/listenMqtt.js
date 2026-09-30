@@ -3,13 +3,64 @@
 var utils = require("../utils");
 var log = require("npmlog");
 var websocket = require('./websocket');
+var GatewayPresence = require("./gatewayPresence");
 
 var identity = function () {};
 
-//Don't really know what this does but I think it's for the active state
-//TODO: Move to ctx when implemented
-var chatOn = true;
-var foreground = false;
+function clearPresenceTimer(ctx) {
+  if (ctx.presenceCheckTimer) {
+    clearInterval(ctx.presenceCheckTimer);
+    ctx.presenceCheckTimer = undefined;
+  }
+  if (ctx.presenceClient) {
+    ctx.presenceClient.stop();
+  }
+}
+
+function rememberMessageBody(ctx, messageID, body) {
+  if (!ctx.messageBodies) ctx.messageBodies = new Map();
+  ctx.messageBodies.set(messageID, body);
+  if (ctx.messageBodies.size > 1000) {
+    ctx.messageBodies.delete(ctx.messageBodies.keys().next().value);
+  }
+}
+
+function timestampString(value) {
+  return value == null ? value : value.toString();
+}
+
+// Message edits arrive as a bare NoOp delta with no thread or content, so
+// refetch the last messages of the most recently active thread and emit
+// message_edit for bodies that changed. (Facebook appends " (edited)" to the
+// stored body.)
+function checkForEdits(api, ctx, globalCallback) {
+  if (!ctx.globalOptions.listenEvents || !ctx.lastThreadID || ctx.editCheckInFlight) return;
+  var threadID = ctx.lastThreadID;
+  ctx.editCheckInFlight = true;
+  api.getThreadHistory(threadID, 10, null, function(err, messages) {
+    ctx.editCheckInFlight = false;
+    if (err || !Array.isArray(messages)) return;
+    messages.forEach(function(message) {
+      if (!message || !message.messageID) return;
+      var known = ctx.messageBodies.get(message.messageID);
+      if (known === undefined) {
+        rememberMessageBody(ctx, message.messageID, message.body);
+      } else if (typeof message.body === "string" && message.body !== known) {
+        rememberMessageBody(ctx, message.messageID, message.body);
+        globalCallback(null, {
+          type: "message_edit",
+          threadID: message.threadID || threadID,
+          messageID: message.messageID,
+          body: message.body,
+          previousBody: known,
+          senderID: message.senderID,
+          timestamp: message.timestamp,
+          isGroup: !!message.isGroup
+        });
+      }
+    });
+  });
+}
 
 var topics = [
   "/t_ms",
@@ -40,8 +91,12 @@ function listenMqtt(defaultFuncs, api, ctx, globalCallback, startup) {
   var username = {
     u: ctx.userID,
     s: sessionID,
-    chat_on: chatOn,
-    fg: foreground,
+    // `online` is the browser's active status: chat_on marks the account as
+    // available and fg/foreground mark the session as focused, which is what
+    // makes Facebook show it as "Active now". See the `online` option for
+    // staying in the background instead.
+    chat_on: ctx.globalOptions.online,
+    fg: ctx.globalOptions.online,
     d: utils.getGUID(),
     ct: "websocket",
     //App id from facebook
@@ -55,6 +110,21 @@ function listenMqtt(defaultFuncs, api, ctx, globalCallback, startup) {
     no_auto_fg: true,
     gas: null
   };
+
+  // Message bodies seen while listening, so an edit (which arrives as a bare
+  // NoOp delta) can be detected by comparing against a refetch.
+  ctx.messageBodies = new Map();
+
+  // The account's "Active now" status is reported over the gateway, the way
+  // the web client does; see src/gatewayPresence.js. `online` turns it on and
+  // off, including at runtime (checked periodically).
+  if (!ctx.presenceClient) ctx.presenceClient = new GatewayPresence(ctx);
+  if (ctx.globalOptions.online) ctx.presenceClient.start();
+  ctx.presenceCheckTimer = setInterval(function() {
+    if (ctx.globalOptions.online) ctx.presenceClient.start();
+    else ctx.presenceClient.stop();
+  }, 10000);
+
   var cookies = ctx.jar.getCookies("https://www.facebook.com").join("; ");
 
   //Region could be changed for better ping. (Region atn: Southeast Asia, region ash: West US, prob) (Don't really know if we need it).
@@ -95,6 +165,7 @@ function listenMqtt(defaultFuncs, api, ctx, globalCallback, startup) {
       return;
     }
     log.error(err);
+    clearPresenceTimer(ctx);
     mqttClient.end();
     globalCallback("Connection refused: Server unavailable", null);
   });
@@ -161,6 +232,7 @@ function listenMqtt(defaultFuncs, api, ctx, globalCallback, startup) {
         from: jsonMessage.sender_fbid.toString(),
         threadID: utils.formatID((jsonMessage.thread || jsonMessage.sender_fbid).toString())
       };
+      ctx.lastThreadID = typ.threadID;
       (function () { globalCallback(null, typ); })();
     } else if (topic === "/orca_presence") {
       if (ctx.globalOptions.updatePresence) {
@@ -214,6 +286,8 @@ function parseDelta(defaultFuncs, api, ctx, globalCallback, v) {
           if (ctx.globalOptions.autoMarkDelivery) {
             markDelivery(ctx, defaultFuncs, api, fmtMsg.threadID, fmtMsg.messageID, fmtMsg.senderID);
           }
+          rememberMessageBody(ctx, fmtMsg.messageID, fmtMsg.body);
+          ctx.lastThreadID = fmtMsg.threadID;
         }
         return !ctx.globalOptions.selfListen &&
           fmtMsg.senderID === ctx.userID ?
@@ -248,27 +322,45 @@ function parseDelta(defaultFuncs, api, ctx, globalCallback, v) {
       for (var i in clientPayload.deltas) {
         var delta = clientPayload.deltas[i];
         if (delta.deltaMessageReaction && !!ctx.globalOptions.listenEvents) {
+          var reactionThreadID = (delta.deltaMessageReaction.threadKey
+            .threadFbId ?
+            delta.deltaMessageReaction.threadKey.threadFbId : delta.deltaMessageReaction.threadKey
+              .otherUserFbId).toString();
+          ctx.lastThreadID = reactionThreadID;
           (function () { globalCallback(null, {
             type: "message_reaction",
-            threadID: (delta.deltaMessageReaction.threadKey
-              .threadFbId ?
-              delta.deltaMessageReaction.threadKey.threadFbId : delta.deltaMessageReaction.threadKey
-                .otherUserFbId).toString(),
+            threadID: reactionThreadID,
             messageID: delta.deltaMessageReaction.messageId,
             reaction: delta.deltaMessageReaction.reaction,
             senderID: delta.deltaMessageReaction.senderId.toString(),
             userID: delta.deltaMessageReaction.userId.toString()
           }); })();
         } else if (delta.deltaRecallMessageData && !!ctx.globalOptions.listenEvents) {
+          var recallThreadID = (delta.deltaRecallMessageData.threadKey.threadFbId ?
+            delta.deltaRecallMessageData.threadKey.threadFbId : delta.deltaRecallMessageData.threadKey
+              .otherUserFbId).toString();
+          ctx.lastThreadID = recallThreadID;
           (function () { globalCallback(null, {
             type: "message_unsend",
-            threadID: (delta.deltaRecallMessageData.threadKey.threadFbId ?
-              delta.deltaRecallMessageData.threadKey.threadFbId : delta.deltaRecallMessageData.threadKey
-                .otherUserFbId).toString(),
+            threadID: recallThreadID,
             messageID: delta.deltaRecallMessageData.messageID,
             senderID: delta.deltaRecallMessageData.senderID.toString(),
             deletionTimestamp: delta.deltaRecallMessageData.deletionTimestamp,
             timestamp: delta.deltaRecallMessageData.timestamp
+          }); })();
+        } else if (delta.deltaRemoveMessage && !!ctx.globalOptions.listenEvents) {
+          var removeThreadID = (delta.deltaRemoveMessage.threadKey.threadFbId ?
+            delta.deltaRemoveMessage.threadKey.threadFbId : delta.deltaRemoveMessage.threadKey
+              .otherUserFbId).toString();
+          ctx.lastThreadID = removeThreadID;
+          (function () { globalCallback(null, {
+            type: "message_self_delete",
+            threadID: removeThreadID,
+            messageID: delta.deltaRemoveMessage.messageIds.length === 1 ?
+              delta.deltaRemoveMessage.messageIds[0] : delta.deltaRemoveMessage.messageIds,
+            senderID: api.getCurrentUserID(),
+            deletionTimestamp: delta.deltaRemoveMessage.deletionTimestamp,
+            timestamp: delta.deltaRemoveMessage.timestamp
           }); })();
         } else if (delta.deltaMessageReply) {
           //Mention block - #1
@@ -315,7 +407,7 @@ function parseDelta(defaultFuncs, api, ctx, globalCallback, v) {
             body: delta.deltaMessageReply.message.body || "",
             isGroup: !!delta.deltaMessageReply.message.messageMetadata.threadKey.threadFbId,
             mentions: mentions,
-            timestamp: delta.deltaMessageReply.message.messageMetadata.timestamp,
+            timestamp: timestampString(delta.deltaMessageReply.message.messageMetadata.timestamp),
           };
 
           if (delta.deltaMessageReply.repliedToMessage) {
@@ -362,9 +454,11 @@ function parseDelta(defaultFuncs, api, ctx, globalCallback, v) {
               body: delta.deltaMessageReply.repliedToMessage.body || "",
               isGroup: !!delta.deltaMessageReply.repliedToMessage.messageMetadata.threadKey.threadFbId,
               mentions: rmentions,
-              timestamp: delta.deltaMessageReply.repliedToMessage.messageMetadata.timestamp,
+              timestamp: timestampString(delta.deltaMessageReply.repliedToMessage.messageMetadata.timestamp),
             };
           }
+
+          ctx.lastThreadID = callbackToReturn.threadID;
 
           if (ctx.globalOptions.autoMarkDelivery) {
             markDelivery(ctx, defaultFuncs, api, callbackToReturn.threadID, callbackToReturn.messageID, callbackToReturn.senderID);
@@ -386,6 +480,11 @@ function parseDelta(defaultFuncs, api, ctx, globalCallback, v) {
     return;
 
   switch (v.delta.class) {
+    case "NoOp":
+      // Facebook sends a bare NoOp delta when a message is edited (no thread,
+      // no content); refetch the last active thread to detect the new body.
+      checkForEdits(api, ctx, globalCallback);
+      return;
     case "ReadReceipt":
       var fmtMsg;
       try {
@@ -568,6 +667,7 @@ module.exports = function (defaultFuncs, api, ctx) {
       ctx.mqttClient.end(true);
       ctx.mqttClient = undefined;
     }
+    clearPresenceTimer(ctx);
 
     //Reset some stuff
     ctx.lastSeqId = 0;
@@ -580,6 +680,7 @@ module.exports = function (defaultFuncs, api, ctx) {
     var client = ctx.mqttClient;
 
     function closeStartedClient() {
+      clearPresenceTimer(ctx);
       if (ctx.mqttClient === client) {
         client.end(true);
         ctx.mqttClient = undefined;
@@ -646,6 +747,8 @@ module.exports = function (defaultFuncs, api, ctx) {
     var stopListening = function () {
       globalCallback = identity;
       ctx.globalCallback = undefined;
+
+      clearPresenceTimer(ctx);
 
       if(ctx.mqttClient)
       {

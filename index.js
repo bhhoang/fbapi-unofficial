@@ -36,6 +36,9 @@ function setOptions(globalOptions, options) {
       case 'updatePresence':
         globalOptions.updatePresence = options.updatePresence;
         break;
+      case 'online':
+        globalOptions.online = options.online;
+        break;
       case 'forceLogin':
         globalOptions.forceLogin = options.forceLogin;
         break;
@@ -926,7 +929,10 @@ function loginHelper(appState, email, password, globalOptions, callback) {
     // sent here is gone: its reply was empty, and online status was the same
     // with and without it (see CHANGELOG).
     .then(function() {
-      var presence = utils.generatePresence(ctx.userID);
+      // With `online` (the default) log in carrying the browser-format
+      // presence cookie, which is what makes Facebook mark the session
+      // active; the legacy cookie doesn't update the active status.
+      var presence = globalOptions.online !== false ? utils.generatePresenceCookie() : utils.generatePresence(ctx.userID);
       ctx.jar.setCookie("presence=" + presence + "; path=/; domain=.facebook.com; secure", "https://www.facebook.com");
       ctx.jar.setCookie("presence=" + presence + "; path=/; domain=.messenger.com; secure", "https://www.messenger.com");
       ctx.jar.setCookie("locale=en_US; path=/; domain=.facebook.com; secure", "https://www.facebook.com");
@@ -973,6 +979,10 @@ function login(loginData, options, callback) {
     selfListen: false,
     listenEvents: false,
     updatePresence: false,
+    // Makes listenMqtt announce the account as available and in the
+    // foreground, so Facebook shows it as "Active now" (online) while the bot
+    // is running; false connects in the background instead.
+    online: true,
     forceLogin: false,
     autoMarkDelivery: true,
     autoMarkRead: false,
