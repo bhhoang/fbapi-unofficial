@@ -169,7 +169,28 @@ function sameBuffer(a, b) {
   return require("crypto").timingSafeEqual(a, b);
 }
 
-function decryptWithSession(store, jid, session, message, isPreKeyMessage) {
+// Keeps the key used for the last few messages of a session, so a message
+// that re-uses an envelope (a revoke re-sends the revoked message's envelope
+// with a different plaintext) can still be decrypted. Same-counter messages
+// with the same ciphertext are still treated as duplicates.
+function rememberRecentMessageKey(session, counterKey, keys, body) {
+  if (!session.recentMessageKeys) session.recentMessageKeys = {};
+  if (!session.recentMessageKeyOrder) session.recentMessageKeyOrder = [];
+  if (!session.recentMessageKeys[counterKey]) {
+    session.recentMessageKeyOrder.push(counterKey);
+  }
+  session.recentMessageKeys[counterKey] = {
+    cipherKey: bufToB64(keys.cipherKey),
+    macKey: bufToB64(keys.macKey),
+    iv: bufToB64(keys.iv),
+    body: bufToB64(body || Buffer.alloc(0))
+  };
+  while (session.recentMessageKeyOrder.length > 50) {
+    delete session.recentMessageKeys[session.recentMessageKeyOrder.shift()];
+  }
+}
+
+function decryptWithSession(store, jid, session, message, isPreKeyMessage, skipSave) {
   if (!message.ratchetKey) throw new Error("Signal message has no ratchet key");
   var ratchetKeyB64 = bufToB64(message.ratchetKey);
   if (session.remoteRatchetKey !== ratchetKeyB64) {
@@ -199,21 +220,37 @@ function decryptWithSession(store, jid, session, message, isPreKeyMessage) {
   }
 
   var messageKeys;
+  var counterKey = skipKeyId(ratchetKeyB64, message.counter);
   if (message.counter < session.receiverCounter) {
-    var skipped = session.skippedKeys && session.skippedKeys[skipKeyId(ratchetKeyB64, message.counter)];
-    if (!skipped) throw new Error("Duplicate or too old message (counter " + message.counter + ")");
-    messageKeys = {
-      cipherKey: b64ToBuf(skipped.cipherKey),
-      macKey: b64ToBuf(skipped.macKey),
-      iv: b64ToBuf(skipped.iv)
-    };
-    delete session.skippedKeys[skipKeyId(ratchetKeyB64, message.counter)];
+    var skipped = session.skippedKeys && session.skippedKeys[counterKey];
+    var recent = session.recentMessageKeys && session.recentMessageKeys[counterKey];
+    if (recent && recent.body === bufToB64(message.body || Buffer.alloc(0))) {
+      throw new Error("Duplicate or too old message (counter " + message.counter + ")");
+    }
+    if (recent) {
+      messageKeys = {
+        cipherKey: b64ToBuf(recent.cipherKey),
+        macKey: b64ToBuf(recent.macKey),
+        iv: b64ToBuf(recent.iv)
+      };
+    } else if (skipped) {
+      messageKeys = {
+        cipherKey: b64ToBuf(skipped.cipherKey),
+        macKey: b64ToBuf(skipped.macKey),
+        iv: b64ToBuf(skipped.iv)
+      };
+      delete session.skippedKeys[counterKey];
+      rememberRecentMessageKey(session, counterKey, messageKeys, message.body);
+    } else {
+      throw new Error("Duplicate or too old message (counter " + message.counter + ")");
+    }
   } else {
     storeSkippedKeys(session, ratchetKeyB64, session.receiverCounter, message.counter);
     var step = deriveMessageKeysForKey(b64ToBuf(session.receiverChainKey));
     messageKeys = step.keys;
     session.receiverChainKey = bufToB64(step.nextChainKey);
     session.receiverCounter = message.counter + 1;
+    rememberRecentMessageKey(session, counterKey, messageKeys, message.body);
   }
 
   var senderIdentity = concatPublicKey(b64ToBuf(session.remoteIdentity));
@@ -229,7 +266,7 @@ function decryptWithSession(store, jid, session, message, isPreKeyMessage) {
   }
 
   var plaintext = cryptoUtils.aesCbcDecrypt(messageKeys.cipherKey, messageKeys.iv, message.ciphertext);
-  saveSession(store, jid, session);
+  if (!skipSave) saveSession(store, jid, session);
   return plaintext;
 }
 
@@ -245,8 +282,15 @@ function decryptPreKey(store, senderJid, ciphertext) {
     throw new Error("No signed prekey " + preKeyMessage.signedPreKeyId + " for " + senderJid);
   }
   var oneTime = null;
+  var replayedPreKey = false;
   if (preKeyMessage.preKeyId !== null) {
     oneTime = store.takePreKey(preKeyMessage.preKeyId);
+    if (!oneTime) {
+      // A revoke re-sends the revoked message's envelope, including its
+      // one-time prekey; decrypt with it without replacing the live session.
+      oneTime = store.getUsedPreKey(preKeyMessage.preKeyId);
+      replayedPreKey = !!oneTime;
+    }
     if (!oneTime) {
       throw new Error("No one-time prekey " + preKeyMessage.preKeyId + " for " + senderJid);
     }
@@ -279,6 +323,9 @@ function decryptPreKey(store, senderJid, ciphertext) {
     skippedKeys: {},
     processedPreKeyBaseKey: bufToB64(preKeyMessage.baseKey)
   };
+  if (replayedPreKey) {
+    return decryptWithSession(store, senderJid, session, decodeSignalMessage(preKeyMessage.message), true, true);
+  }
   store.sessions[addressKey(senderJid)] = session;
   store.identities[preKeyMessage.identityKey.toString("base64")] = 1;
   if (store.save) store.save();

@@ -1,7 +1,5 @@
 "use strict";
 
-/* global BigInt */
-
 var http = require("../http");
 var fs = require("fs");
 var log = require("npmlog");
@@ -88,6 +86,15 @@ function encodeMessageTransport(opts) {
       .string(2, opts.dsm.phash || "")
       .build();
     integral.bytes(2, dsm);
+  } else if (opts.messageRef != null) {
+    // Recipient-side copies carry the message's own (sender-assigned) id:
+    // integral.f2 = {f5: {f1: "<id>", f2: 1}} - captured from the phone's
+    // working envelopes; Meta's clients do not register a copy without it.
+    var ref = new proto.ProtoWriter()
+      .string(1, String(opts.messageRef))
+      .varint(2, 1)
+      .build();
+    integral.bytes(2, new proto.ProtoWriter().bytes(5, ref).build());
   }
   var protocol = new proto.ProtoWriter().bytes(1, integral.build()).bytes(2, Buffer.alloc(0)).build();
   var transport = new proto.ProtoWriter();
@@ -95,7 +102,7 @@ function encodeMessageTransport(opts) {
   return transport.bytes(2, protocol).build();
 }
 
-function encodeMessageApplication(consumerApp) {
+function encodeMessageApplication(consumerApp, reply) {
   var frankingKey = require("crypto").randomBytes(32);
   var subProtocol = new proto.ProtoWriter()
     .bytes(1, consumerApp)
@@ -103,8 +110,22 @@ function encodeMessageApplication(consumerApp) {
     .build();
   var payloadSubProto = new proto.ProtoWriter().varint(1, 0).bytes(2, subProtocol).build();
   var appPayload = new proto.ProtoWriter().bytes(4, payloadSubProto).build();
-  var metadata = new proto.ProtoWriter().bytes(8, frankingKey).varint(9, 0).build();
-  var messageApp = new proto.ProtoWriter().bytes(1, appPayload).bytes(2, metadata).build();
+  var metadata = new proto.ProtoWriter().bytes(8, frankingKey).varint(9, 0);
+  if (reply && reply.quotedId != null) {
+    // Captured from the web client replying in an encrypted chat: the quoted
+    // message is referenced by its numeric offline-threading-style id (field 1)
+    // and the quoted sender's bare jid (field 3) on field 10 of the message
+    // metadata. (An extra field breaks Meta's parsers - keep it exact.)
+    var replyBlock = new proto.ProtoWriter()
+      .string(1, String(reply.quotedId))
+      .string(3, String(reply.quotedSenderJid))
+      .build();
+    metadata.bytes(10, replyBlock);
+  }
+  var messageApp = new proto.ProtoWriter()
+    .bytes(1, appPayload)
+    .bytes(2, metadata.build())
+    .build();
   var frankingTag = cryptoUtils.hmacSha256(frankingKey, messageApp);
   return { messageApp: messageApp, frankingTag: frankingTag };
 }
@@ -196,6 +217,12 @@ function decodeConsumerContent(bytes) {
     var payloadSubProtocol = appPayloadContainer && appPayloadContainer[4]
       ? proto.decodeFields(appPayloadContainer[4])
       : null;
+    if (payloadSubProtocol && payloadSubProtocol[1]) {
+      // Protocol message (currently only the message revoke used by "remove
+      // for everyone"); the revoked message's key is nested inside.
+      var revokedID = findMessageKeyID(proto.decodeFields(payloadSubProtocol[1]), 0);
+      if (revokedID) return { kind: "revoke", revoke: { targetMessageID: revokedID } };
+    }
     var subProtocol = payloadSubProtocol && payloadSubProtocol[2]
       ? proto.decodeFields(payloadSubProtocol[2])
       : null;
@@ -211,12 +238,61 @@ function decodeConsumerContent(bytes) {
         text: messageText[1] ? Buffer.from(messageText[1]).toString("utf8") : ""
       };
     }
+    if (content[16]) {
+      var reactionFields = proto.decodeFields(content[16]);
+      var reactionKey = reactionFields[1] ? proto.decodeFields(reactionFields[1]) : null;
+      return {
+        kind: "reaction",
+        reaction: {
+          targetMessageID: reactionKey && reactionKey[3] ? Buffer.from(reactionKey[3]).toString("utf8") : null,
+          // Absent when the reaction was removed.
+          text: reactionFields[2] != null ? Buffer.from(reactionFields[2]).toString("utf8") : null,
+          timestamp: reactionFields[4] != null ? Number(reactionFields[4]) : null
+        }
+      };
+    }
+    if (content[19]) {
+      var editFields = proto.decodeFields(content[19]);
+      var editKey = editFields[1] ? proto.decodeFields(editFields[1]) : null;
+      var editContent = editFields[2] ? proto.decodeFields(editFields[2]) : null;
+      return {
+        kind: "edit",
+        edit: {
+          targetMessageID: editKey && editKey[3] ? Buffer.from(editKey[3]).toString("utf8") : null,
+          text: editContent && editContent[1] ? Buffer.from(editContent[1]).toString("utf8") : "",
+          timestamp: editFields[3] != null ? Number(editFields[3]) : null
+        }
+      };
+    }
     var media = mediaLib.parseConsumerMedia(consumerApp);
     if (media) return { kind: "media", media: media };
     return { kind: "other" };
   } catch (e) {
     return null;
   }
+}
+
+// Depth-first search for a message key ({2: fromMe, 3: message id}) inside a
+// decoded protocol payload.
+function findMessageKeyID(obj, depth) {
+  if (!obj || depth > 12) return null;
+  if (obj[3] != null && Buffer.isBuffer(obj[3])) {
+    var id = Buffer.from(obj[3]).toString("utf8");
+    if (/^[0-9]{8,}$/.test(id)) return id;
+  }
+  var keys = Object.keys(obj);
+  for (var i = 0; i < keys.length; i++) {
+    var value = obj[keys[i]];
+    if (Buffer.isBuffer(value)) {
+      var nested = null;
+      try { nested = proto.decodeFields(value); } catch (e) { /* not a message */ }
+      if (nested) {
+        var found = findMessageKeyID(nested, depth + 1);
+        if (found) return found;
+      }
+    }
+  }
+  return null;
 }
 
 function decodeConsumerText(bytes) {
@@ -864,6 +940,14 @@ E2EEClient.prototype.handleEncryptedMessage = function(node) {
   var senderId = signal.parseJid(senderJid).user;
   var messageId = node.attrs.id || null;
 
+  if (
+    payload && threadId && this.ctx.globalOptions.listenEvents &&
+    (payload.kind === "reaction" || payload.kind === "edit" || payload.kind === "revoke")
+  ) {
+    var event = this.buildE2EEEvent(payload, threadId, senderId);
+    if (event && this.ctx.globalCallback) this.ctx.globalCallback(null, event);
+  }
+
   if (payload && (payload.kind === "text" || payload.kind === "media") && threadId) {
     var body = payload.kind === "text" ? payload.text : payload.media.caption || "";
     var attachments = payload.kind === "media" ? [buildAttachment(payload.media)] : [];
@@ -901,6 +985,62 @@ E2EEClient.prototype.handleEncryptedMessage = function(node) {
   }
 
   this.sendAck(node);
+};
+
+// Turns a decoded E2EE reaction/edit/revoke into the same event shapes the
+// regular (MQTT) listener uses.
+E2EEClient.prototype.buildE2EEEvent = function(payload, threadId, senderId) {
+  var thread = String(threadId);
+  if (payload.kind === "reaction" && payload.reaction.targetMessageID) {
+    var reaction = {
+      type: "message_reaction",
+      threadID: thread,
+      messageID: payload.reaction.targetMessageID,
+      senderID: senderId,
+      userID: senderId
+    };
+    if (payload.reaction.text != null) reaction.reaction = payload.reaction.text;
+    return reaction;
+  }
+  if (payload.kind === "edit" && payload.edit.targetMessageID) {
+    var previous = this.findHistoryMessage(threadId, payload.edit.targetMessageID);
+    var previousBody = previous ? previous.body : null;
+    var originalTimestamp = previous ? previous.timestamp : null;
+    if (previous) {
+      previous.body = payload.edit.text;
+      this.store.save();
+    }
+    return {
+      type: "message_edit",
+      threadID: thread,
+      messageID: payload.edit.targetMessageID,
+      body: payload.edit.text,
+      previousBody: previousBody,
+      senderID: senderId,
+      timestamp: originalTimestamp != null ? originalTimestamp : payload.edit.timestamp,
+      isGroup: false
+    };
+  }
+  if (payload.kind === "revoke" && payload.revoke.targetMessageID) {
+    var revoked = this.findHistoryMessage(threadId, payload.revoke.targetMessageID);
+    return {
+      type: "message_unsend",
+      threadID: thread,
+      messageID: payload.revoke.targetMessageID,
+      senderID: senderId,
+      deletionTimestamp: Date.now(),
+      timestamp: revoked ? revoked.timestamp : Date.now()
+    };
+  }
+  return null;
+};
+
+E2EEClient.prototype.findHistoryMessage = function(threadId, messageID) {
+  var list = this.store.history[String(threadId)] || [];
+  for (var i = list.length - 1; i >= 0; i--) {
+    if (list[i] && list[i].messageID === messageID) return list[i];
+  }
+  return null;
 };
 
 E2EEClient.prototype.sendRetryReceipt = function(node) {
@@ -1196,10 +1336,14 @@ E2EEClient.prototype.connect = function(callback) {
     }
     return this.connectPromise;
   }
-  this.connectPromise = this._connect().catch(function(err) {
-    self.connectPromise = null;
-    throw err;
-  });
+  this.connectPromise = this._connect()
+    .catch(function(err) {
+      return self.recoverEvictedDevice(err);
+    })
+    .catch(function(err) {
+      self.connectPromise = null;
+      throw err;
+    });
   if (callback) {
     this.connectPromise.then(
       function(result) {
@@ -1211,6 +1355,42 @@ E2EEClient.prototype.connect = function(callback) {
     );
   }
   return this.connectPromise;
+};
+
+// Meta drops a device the account no longer lists (usually because too many
+// new web devices were registered) and then rejects its login with
+// "<failure reason=\"415\">". The identity keys stay valid, so register again
+// under a fresh device id instead of failing forever. One recovery per
+// process; if the new device is rejected too, surface that instead of
+// registering devices endlessly.
+E2EEClient.prototype.recoverEvictedDevice = function(err) {
+  var self = this;
+  var message = String((err && err.message) || err || "");
+  if (!/E2EE login failure: 415/.test(message)) return Promise.reject(err);
+  if (!this.store || !this.store.jidDevice || this._deviceRecovered) {
+    return Promise.reject(err);
+  }
+  this._deviceRecovered = true;
+  log.warn(
+    "e2ee",
+    "E2EE device " + this.store.jidDevice + " was rejected (415); registering a new device id with the same identity"
+  );
+  this.store.jidDevice = null;
+  // Peers have long since discarded their sessions with the evicted device
+  // (messages sent over those stale sessions are undecryptable - "Waiting for
+  // this message - and their retry requests only help while a client is
+  // listening). Drop them so the next sends establish fresh, working sessions.
+  this.store.sessions = {};
+  try {
+    this.store.save();
+  } catch (e) {
+    log.warn("e2ee", "could not save the device store before re-registering: " + e.message);
+  }
+  if (this.socket) {
+    try { this.socket.close(); } catch (e) { /* already closed */ }
+    this.socket = null;
+  }
+  return this._connect();
 };
 
 E2EEClient.prototype._connect = function() {
@@ -1308,11 +1488,37 @@ E2EEClient.prototype._connect = function() {
   });
 };
 
-E2EEClient.prototype.sendText = function(threadId, text, callback) {
+// Best-effort sender jid for a quoted message: the local history of the
+// thread usually knows it (messages received or sent through this library);
+// otherwise the one-to-one peer is assumed.
+E2EEClient.prototype.quotedSenderJid = function(threadId, quotedId) {
+  var hist = this.store && this.store.e2ee_history && this.store.e2ee_history[String(threadId)];
+  if (Array.isArray(hist)) {
+    for (var i = hist.length - 1; i >= 0; i--) {
+      if (hist[i] && String(hist[i].messageID) === String(quotedId)) {
+        return String(hist[i].senderID) + "@msgr";
+      }
+    }
+  }
+  return String(threadId) + "@msgr";
+};
+
+E2EEClient.prototype.resolveReply = function(threadId, reply) {
+  if (!reply || reply.quotedId == null) return null;
+  var quotedId = String(reply.quotedId);
+  return {
+    quotedId: quotedId,
+    quotedSenderJid: reply.quotedSenderJid
+      ? String(reply.quotedSenderJid)
+      : this.quotedSenderJid(threadId, quotedId)
+  };
+};
+
+E2EEClient.prototype.sendText = function(threadId, text, callback, reply) {
   var self = this;
   this.connect()
     .then(function() {
-      return self._sendMessageApp(threadId, encodeTextMessage(text), "text", text);
+      return self._sendMessageApp(threadId, encodeTextMessage(text), "text", text, undefined, reply);
     })
     .then(
       function(info) {
@@ -1324,7 +1530,7 @@ E2EEClient.prototype.sendText = function(threadId, text, callback) {
     );
 };
 
-E2EEClient.prototype.sendAttachment = function(threadId, attachment, callback) {
+E2EEClient.prototype.sendAttachment = function(threadId, attachment, callback, reply) {
   var self = this;
   if (String(threadId).indexOf("@g.us") !== -1) {
     return callback({
@@ -1353,7 +1559,8 @@ E2EEClient.prototype.sendAttachment = function(threadId, attachment, callback) {
         consumerApp,
         "media",
         attachment.caption || "",
-        protocolMediaType(attachment.kind)
+        protocolMediaType(attachment.kind),
+        reply
       );
     })
     .then(
@@ -1366,7 +1573,7 @@ E2EEClient.prototype.sendAttachment = function(threadId, attachment, callback) {
     );
 };
 
-E2EEClient.prototype._sendMessageApp = function(threadId, consumerApp, nodeType, historyBody, protocolMediaType) {
+E2EEClient.prototype._sendMessageApp = function(threadId, consumerApp, nodeType, historyBody, protocolMediaType, reply) {
   var self = this;
   var store = this.store;
   var toJid = normalizeThreadJid(threadId);
@@ -1374,8 +1581,11 @@ E2EEClient.prototype._sendMessageApp = function(threadId, consumerApp, nodeType,
   var selfBare = bareJid(selfJid);
   var messageId = this.nextMessageId();
 
-  var app = encodeMessageApplication(consumerApp);
-  var devicePayload = encodeMessageTransport({ messageApp: app.messageApp });
+  var app = encodeMessageApplication(consumerApp, this.resolveReply(threadId, reply));
+  var devicePayload = encodeMessageTransport({
+    messageApp: app.messageApp,
+    messageRef: messageId
+  });
   var selfDevicePayload = encodeMessageTransport({
     messageApp: app.messageApp,
     dsm: { destinationJid: toJid, phash: "" }
@@ -1427,6 +1637,15 @@ E2EEClient.prototype._sendMessageApp = function(threadId, consumerApp, nodeType,
       if (usable.length === 0) {
         throw new Error(
           "Could not establish an E2EE session for " + threadId + " (" + failures.join("; ") + ")"
+        );
+      }
+      if (failures.length > 0) {
+        // Some of the chat's devices get no copy; their clients will show the
+        // message as undecryptable, so make that visible instead of silent.
+        log.warn(
+          "e2ee",
+          "No E2EE session could be established for " + failures.length +
+            " device(s) of " + threadId + ": " + failures.join("; ")
         );
       }
       var participantNodes = usable.map(function(deviceJid) {

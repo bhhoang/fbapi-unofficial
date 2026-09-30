@@ -1914,6 +1914,8 @@ __Message__
 
 The message object will contain different fields based on its type (as determined by its `type` field). By default, the only type that will be listened for is `message`. If enabled through [setOptions](#setOptions), the message object may alternatively represent an event e.g. a read receipt. The available event types are as follows:
 
+`message`, `typ`, `message_reaction`, `message_unsend`, `message_reply`, `message_edit` and `message_self_delete` are also delivered for end-to-end encrypted one-to-one chats (E2EE), provided the E2EE client is connected (see [api.connectE2EE](#connectE2EE)) and `listenEvents` is on for the event types. The only difference: an E2EE `message_edit.body` carries the new text as typed (no Facebook ` (edited)` suffix).
+
 <table>
 	<tr>
 		<th>Event Type</th>

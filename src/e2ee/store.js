@@ -41,6 +41,8 @@ function DeviceStore(filePath) {
   this.jidDevice = 0;
   this.nextPreKeyId = 1;
   this.preKeys = {};
+  this.usedPreKeys = {};
+  this.usedPreKeyOrder = [];
   this.signedPreKeys = {};
   this.sessions = {};
   this.identities = {};
@@ -96,8 +98,21 @@ DeviceStore.prototype.getSignedPreKeyById = function(id) {
 
 DeviceStore.prototype.takePreKey = function(id) {
   var key = this.preKeys[id];
-  if (key) delete this.preKeys[id];
+  if (key) {
+    delete this.preKeys[id];
+    // Keep recently used one-time prekeys: a message revoke re-uses the
+    // envelope of the message it revokes, including its one-time prekey.
+    this.usedPreKeys[id] = key;
+    this.usedPreKeyOrder.push(id);
+    while (this.usedPreKeyOrder.length > 100) {
+      delete this.usedPreKeys[this.usedPreKeyOrder.shift()];
+    }
+  }
   return key || null;
+};
+
+DeviceStore.prototype.getUsedPreKey = function(id) {
+  return this.usedPreKeys[id] || null;
 };
 
 DeviceStore.prototype.generatePreKeys = function(count) {
@@ -139,6 +154,8 @@ DeviceStore.prototype.save = function() {
     jid_device: this.jidDevice,
     next_pre_key_id: this.nextPreKeyId,
     pre_keys: this.preKeys,
+    used_pre_keys: this.usedPreKeys,
+    used_pre_key_order: this.usedPreKeyOrder,
     sessions: this.sessions,
     identities: this.identities,
     e2ee_threads: this.threads,
@@ -165,6 +182,8 @@ DeviceStore.prototype.load = function(data) {
   this.jidDevice = data.jid_device || 0;
   this.nextPreKeyId = data.next_pre_key_id || 1;
   this.preKeys = data.pre_keys || {};
+  this.usedPreKeys = data.used_pre_keys || {};
+  this.usedPreKeyOrder = data.used_pre_key_order || [];
   this.sessions = data.sessions || {};
   this.identities = data.identities || {};
   this.threads = data.e2ee_threads || {};

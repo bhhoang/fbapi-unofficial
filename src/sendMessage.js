@@ -53,6 +53,20 @@ function readAttachmentBuffer(source) {
   });
 }
 
+// Facebook sends replies as part of the message task payload (captured from
+// the web client replying in a group chat):
+//   reply_metadata: {"reply_source_id":"<mid>","reply_source_type":1,
+//                    "reply_type":0,"reply_source_attachment_id":null}
+function buildReplyMetadata(replyToMessage) {
+  if (!replyToMessage) return null;
+  return {
+    reply_source_id: String(replyToMessage),
+    reply_source_type: 1,
+    reply_type: 0,
+    reply_source_attachment_id: null
+  };
+}
+
 module.exports = function(defaultFuncs, api, ctx) {
   function uploadAttachment(attachments, callback) {
     var uploads = [];
@@ -233,15 +247,15 @@ module.exports = function(defaultFuncs, api, ctx) {
           return callback(resData);
         }
 
-        var messageInfo = resData.payload.actions.reduce(function(p, v) {
-          return (
-            {
-              threadID: v.thread_fbid,
-              messageID: v.message_id,
-              timestamp: v.timestamp
-            } || p
-          );
-        }, null);
+        var actions = resData.payload.actions || [];
+        var lastAction = actions[actions.length - 1];
+        var messageInfo = lastAction
+          ? {
+              threadID: lastAction.thread_fbid,
+              messageID: lastAction.message_id,
+              timestamp: lastAction.timestamp
+            }
+          : null;
 
         return callback(null, messageInfo);
       })
@@ -258,24 +272,28 @@ module.exports = function(defaultFuncs, api, ctx) {
   // when Facebook rejects a plaintext send with cutoverHandleInvalidSendToOpen
   // the message is retried through the native E2EE (Signal/Noise) client in
   // src/e2ee, which registers its own E2EE device for the logged-in account.
-  function sendViaMqtt(body, threadID, messageAndOTID, callback) {
+  function sendViaMqtt(body, threadID, messageAndOTID, replyToMessage, callback) {
     var mqttClient = ctx.mqttClient;
     ctx.wsReqNumber = (ctx.wsReqNumber || 0) + 1;
     var requestID = ctx.wsReqNumber;
     threadID = threadID.toString();
 
+    var taskPayload = {
+      thread_id: threadID,
+      otid: messageAndOTID,
+      source: 0,
+      send_type: 1,
+      sync_group: 1,
+      text: body,
+      initiating_source: 1,
+      skip_url_preview_gen: 0
+    };
+    var replyMetadata = buildReplyMetadata(replyToMessage);
+    if (replyMetadata) taskPayload.reply_metadata = replyMetadata;
+
     var task = {
       label: "46",
-      payload: JSON.stringify({
-        thread_id: threadID,
-        otid: messageAndOTID,
-        source: 0,
-        send_type: 1,
-        sync_group: 1,
-        text: body,
-        initiating_source: 1,
-        skip_url_preview_gen: 0
-      }),
+      payload: JSON.stringify(taskPayload),
       queue_name: threadID,
       task_id: 0,
       failure_count: null
@@ -364,7 +382,7 @@ module.exports = function(defaultFuncs, api, ctx) {
     return ctx.e2eeClient;
   }
 
-  function sendViaE2EE(body, threadID, callback) {
+  function sendViaE2EE(body, threadID, replyToMessage, callback) {
     var client = getE2EEClient();
     client.sendText(threadID, body, function(err, info) {
       if (err) {
@@ -374,10 +392,10 @@ module.exports = function(defaultFuncs, api, ctx) {
       ctx.e2eeThreads = ctx.e2eeThreads || {};
       ctx.e2eeThreads[threadID.toString()] = true;
       callback(null, info);
-    });
+    }, replyToMessage ? { quotedId: replyToMessage } : null);
   }
 
-  function sendViaE2EEAttachment(threadID, prepared, callback) {
+  function sendViaE2EEAttachment(threadID, prepared, replyToMessage, callback) {
     if (!prepared || prepared.buffers.length === 0) {
       return callback({
         error: "sendMessage: no attachment data available for an E2EE send."
@@ -415,7 +433,7 @@ module.exports = function(defaultFuncs, api, ctx) {
       ctx.e2eeThreads = ctx.e2eeThreads || {};
       ctx.e2eeThreads[threadID.toString()] = true;
       callback(null, info);
-    });
+    }, replyToMessage ? { quotedId: replyToMessage } : null);
   }
 
   function isKnownE2EEThread(threadID) {
@@ -426,7 +444,6 @@ module.exports = function(defaultFuncs, api, ctx) {
   function isPlainText(form) {
     return (
       !form.has_attachment &&
-      !form.replied_to_message_id &&
       !form["tags[0]"] &&
       form["profile_xmd[0][id]"] === undefined
     );
@@ -500,19 +517,19 @@ module.exports = function(defaultFuncs, api, ctx) {
     };
   }
 
-  function send(form, threadID, messageAndOTID, callback) {
+  function send(form, threadID, messageAndOTID, callback, replyToMessage) {
     if (
       utils.getType(threadID) !== "Array" &&
       !ctx.globalOptions.pageID &&
       isPlainText(form)
     ) {
       if (isKnownE2EEThread(threadID)) {
-        return sendViaE2EE(form.body, threadID, callback);
+        return sendViaE2EE(form.body, threadID, replyToMessage, callback);
       }
       if (ctx.mqttClient && ctx.mqttClient.connected) {
-        return sendViaMqtt(form.body, threadID, messageAndOTID, function(err, info) {
+        return sendViaMqtt(form.body, threadID, messageAndOTID, replyToMessage, function(err, info) {
           if (err && err.e2eeRequired) {
-            return sendViaE2EE(form.body, threadID, callback);
+            return sendViaE2EE(form.body, threadID, replyToMessage, callback);
           }
           callback(err, info);
         });
@@ -788,7 +805,7 @@ module.exports = function(defaultFuncs, api, ctx) {
             handleUrl(msg, form, cb, () =>
               handleEmoji(msg, form, cb, () =>
                 handleMention(msg, form, cb, () =>
-                  send(form, threadID, messageAndOTID, cb)
+                  send(form, threadID, messageAndOTID, cb, replyToMessage)
                 )
               )
             ),
@@ -822,7 +839,7 @@ module.exports = function(defaultFuncs, api, ctx) {
           return proceed(prepared, callback);
         }
         if (isKnownE2EEThread(threadID)) {
-          return sendViaE2EEAttachment(threadID, prepared, callback);
+          return sendViaE2EEAttachment(threadID, prepared, replyToMessage, callback);
         }
         var retried = false;
         proceed(prepared, function(err, info) {
@@ -844,7 +861,7 @@ module.exports = function(defaultFuncs, api, ctx) {
                 : "") +
               "; retrying through the E2EE client."
           );
-          sendViaE2EEAttachment(threadID, prepared, function(e2eeErr, e2eeInfo) {
+          sendViaE2EEAttachment(threadID, prepared, replyToMessage, function(e2eeErr, e2eeInfo) {
             if (!e2eeErr) return callback(null, e2eeInfo);
             callback({
               error:
@@ -866,3 +883,5 @@ module.exports = function(defaultFuncs, api, ctx) {
       });
   };
 };
+
+module.exports.buildReplyMetadata = buildReplyMetadata;
