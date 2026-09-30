@@ -14,6 +14,15 @@ module.exports = function(defaultFuncs, api, ctx) {
     if (!ctx.rtcClient) {
       ctx.rtcClient = new CallClient(ctx, defaultFuncs);
     }
+    // Load the media engines while the connection is being set up, instead of
+    // in the middle of the first call (~0.6 s of blocking the first time).
+    setImmediate(function() {
+      try {
+        require("./rtc/media").preloadEngines();
+      } catch (e) {
+        log.verbose("connectCalls", "Could not preload the media engines: " + e.message);
+      }
+    });
     ctx.rtcClient.ensureConnected(function(err) {
       if (err) {
         log.error("connectCalls", err);

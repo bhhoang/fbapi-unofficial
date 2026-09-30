@@ -323,8 +323,8 @@ __Signaling-only by default__: without the `media` option no audio is transmitte
 
 __Real audio (`options.media`)__: pass `media: true` to negotiate a real WebRTC audio connection. Audio comes from a 16-bit PCM WAV file and/or goes to a WAV recording — Node has no microphone, so both are file/callback based. Two media engines are supported:
 
-* **`@roamhq/wrtc`** (`npm install @roamhq/wrtc`, the full libwebrtc stack) — preferred when installed: Opus is built in, and it supports ICE-TCP and TURN relays over TCP/TLS, which the restricted networks need. This is the engine that was verified working against Facebook's conference.
-* **`werift`** (`npm install werift`, pure JavaScript) + optional [`opusscript`](https://www.npmjs.com/package/opusscript) for Opus — a lighter fallback.
+* **`@roamhq/wrtc`** (`npm install @roamhq/wrtc`, the full libwebrtc stack) — preferred when installed: Opus is built in, and it supports ICE-TCP and TURN relays over TCP/TLS, which the restricted networks need. This is the engine that was verified working against Facebook's conference. It has no video pipeline.
+* **`werift`** (`npm install werift`, pure JavaScript) + optional [`opusscript`](https://www.npmjs.com/package/opusscript) for Opus — a lighter fallback that also carries the video pipeline. **Video calls (one-to-one or group) automatically use this engine**, since the libwebrtc binding cannot send or receive video.
 
 Facebook's call relays (TURN) are fetched automatically (`/videocall/turndiscovery/`) before the media is created, and the client subscribes to the conference's dominant-speaker stream and answers the SFU's renegotiation offers, so audio is both sent and received:
 
@@ -334,10 +334,10 @@ api.call(userID, {
     audioFile: "tts.wav",     // streamed to the call in a loop (8/16/44.1 kHz PCM WAV)
     recordFile: "call.wav",   // written when the call ends
     onAudioData: function(pcm8k) {}, // optional live incoming PCM
-    engine: "wrtc",           // "wrtc" (default when installed) or "werift"
+    engine: "wrtc",           // "wrtc" (default when installed) or "werift" (automatic for video calls)
     codec: "opus",            // werift engine: "opus" (default when available) or "pcmu"
     autoStart: false,         // true = start the file as soon as the media is up
-    audioDelayMs: 3000,       // group calls: wait this long after the peer joins
+    audioDelayMs: 500,        // wait this long after the peer joins
     iceServers: [],           // extra STUN/TURN servers (Facebook's relays are applied automatically)
     iceInterfaceAddresses: [],// pin ICE to specific local interfaces on multi-homed machines
     turnTransport: "tcp",     // prefer the relay over TCP/TLS (restrictive networks)
@@ -346,13 +346,15 @@ api.call(userID, {
 }, callback);
 ```
 
-The audio file is held until the other side is actually in the call (the group-call participant state reaches `CONNECTED`, or the 1:1 call is answered) and then starts after `audioDelayMs` (default 3 s), so the beginning of the file is not played to an empty conference. `autoStart: true` restores the immediate start.
+The audio file (and `videoFile`, which starts with it) is held until the other side is actually in the call (their participant state reaches `CONNECTED`; a 1:1 call falls back to 10 s after it is answered if that state never arrives) and then starts after `audioDelayMs` (default 0.5 s), so the beginning of the file is not played to an empty conference. `autoStart: true` restores the immediate start.
 
 > Media uses the network the same way the web client does: **direct UDP (STUN), ICE-TCP, and Facebook's TURN relays (UDP, plain TCP, TLS)**. On networks that block outbound UDP to Facebook (some VPNs, locked-down corporate links) the client falls back to the TCP transports — the `werift` engine carries DTLS/SRTP over ICE-TCP and TURN-TCP, which has been verified against the conference edge. Set `turnTransport: "tcp"` to prefer the relay over TCP when the direct paths are blocked.
 
 __E2EE (secure) calls__: one-to-one Messenger chats are end-to-end encrypted, so calls placed on them are E2EE mandated. Facebook requires the client's E2EE call state (the `E2eeState` state-sync topic) when joining; this library builds it from its own E2EE device (registering one automatically if needed), and signs the DTLS handshake with the account's identity key (`a=x-dtls-auth`, generated with Meta's frame-encryption wasm, downloaded and cached on first use). Group calls are not E2EE mandated.
 
 Real media for **one-to-one E2EE** calls works as well: the clients trade `E2eeKey` data messages, derive the SFrame keys from them, and every audio frame is encrypted before it leaves the socket and decrypted on arrival (Meta's frame-encryption wasm runs in a helper process). The library subscribes to the peer's track in the conference, answers the SFU's renegotiation offers, and carries the media over ICE-TCP/TURN-TCP when UDP is blocked. Scope: one-to-one voice.
+
+**Group calls** join Facebook's SFU (`ROOM` conference) and, with `video: true`, stream video to every member too — the werift engine is selected automatically because the libwebrtc binding is audio-only. Video viewing from your side arrives once you join and the SFU forwards it. Group calls are not E2EE-mandated (Meta's group call key agreement is not implemented), same as the browser's group calls being secured by the SFU rather than end-to-end.
 
 __Arguments__
 
@@ -366,7 +368,7 @@ __Arguments__
   * `offerSdp`: SDP offer to send (default: a synthesized audio/video offer).
   * `groupThreadID`: Call a group thread, ringing the users in `invitees`.
   * `invitees`: For group calls, the user IDs to ring (default: `[threadID]`).
-  * `mediaMode`: `1` (SFU, default for groups) or `2` (P2P, default for one-to-one).
+  * `mediaMode`: `1` (SFU, default for groups and one-to-one video calls) or `2` (P2P, default for one-to-one voice calls). One-to-one video calls join the SFU directly: started P2P, a Messenger web callee showed the caller's avatar instead of the video.
   * `callTrigger`: Value for the `call_trigger` joining-context field.
   * `timeout`: Milliseconds to wait for Facebook to accept the call (default `20000`).
 * `callback(err, call)`: Called when the call is ringing (or failed). `call` contains `callID` (the thread ID), `state`, `conferenceName`, etc.

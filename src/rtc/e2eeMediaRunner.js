@@ -27,7 +27,9 @@
 //                    { t: "remoteIdentityKey", ... }  learned peer identity key
 //                    { t: "log", message } / { t: "error", message }
 //
-// All byte payloads are base64 so the IPC messages stay JSON.
+// The channel uses advanced serialization: frame payloads travel as binary
+// Buffers (base64 strings are still accepted); the other byte payloads are
+// base64.
 
 var fs = require("fs");
 
@@ -456,6 +458,14 @@ function main(wasm, input, memory) {
   var encryptor = wasm.frameEncryptor_create(encDeps);
   wasm.frameEncryptorDeps_free(encDeps);
   if (!encryptor) return fail("could not create the frame encryptor");
+  // The web client creates one frame encryptor per track (audio and video get
+  // separate counters); mirror that with a second encryptor for video.
+  var encDepsVideo = wasm.frameEncryptorDeps_create();
+  wasm.frameEncryptorDeps_setEncryptionKeysManager(encDepsVideo, ekm);
+  wasm.frameEncryptorDeps_setLoggingCallback(encDepsVideo, logCb);
+  var videoEncryptor = wasm.frameEncryptor_create(encDepsVideo);
+  wasm.frameEncryptorDeps_free(encDepsVideo);
+  if (!videoEncryptor) return fail("could not create the video frame encryptor");
 
   var decryptor = null;
   function setRemoteE2eeId(id) {
@@ -473,44 +483,92 @@ function main(wasm, input, memory) {
     decryptor = wasm.frameDecryptor_create(dDeps);
     wasm.frameDecryptorDeps_free(dDeps);
     if (decryptor) {
-      var typesPtr = allocZeros(4);
-      new DataView(memory.buffer).setInt32(typesPtr, 0, true); // Generic
-      wasm.frameDecryptor_setSupportedFrameDataHandlerTypes(decryptor, typesPtr, 1);
+      var typesPtr = allocZeros(8);
+      var view = new DataView(memory.buffer);
+      view.setInt32(typesPtr, 0, true);     // Generic
+      view.setInt32(typesPtr + 4, 3, true); // H264
+      wasm.frameDecryptor_setSupportedFrameDataHandlerTypes(decryptor, typesPtr, 2);
       wasm.free(typesPtr);
       wasm.frameDecryptor_enableUnencryptedData(decryptor);
     }
   }
 
-  function encryptFrame(data) {
+  // Frame buffers in wasm memory are reused across frames (grown on demand)
+  // instead of being malloc'd and freed for every frame.
+  var sizePtr = allocZeros(4);
+  var scratch = { in: { ptr: 0, size: 0 }, out: { ptr: 0, size: 0 } };
+  function scratchBuffer(slot, size) {
+    var entry = scratch[slot];
+    if (entry.size < size) {
+      if (entry.ptr) wasm.free(entry.ptr);
+      entry.size = Math.max(size, entry.size * 2, 4096);
+      entry.ptr = wasm.malloc(entry.size);
+    }
+    refresh();
+    return entry.ptr;
+  }
+
+  function encryptFrame(data, handlerType, encryptorToUse) {
     if (!encryptionEnabled) return { errorCode: 0, data: data };
+    var activeEncryptor = encryptorToUse || encryptor;
     var len = data.length;
-    var max = wasm.frameEncryptor_getMaxEncryptedSize(encryptor, len);
+    var max = wasm.frameEncryptor_getMaxEncryptedSize(activeEncryptor, len);
     if (max <= 0) return { errorCode: 1, data: null };
-    var input = Buffer.alloc(max);
-    data.copy(input);
-    var buf = alloc(input);
-    var sizePtr = allocZeros(4);
-    var errorCode = wasm.frameEncryptor_encrypt(encryptor, 0, buf, len, buf, max, 0, 0, sizePtr);
+    var buf = scratchBuffer("in", max);
+    heap.set(data, buf);
+    heap.fill(0, buf + len, buf + max);
+    heap.fill(0, sizePtr, sizePtr + 4);
+    // handlerType: FrameDataHandlerType.Generic = 0, H264 = 3 (see the web
+    // client's FrameDataHandlerTypeTypes); H264 keeps the NAL headers clear
+    // and escapes the encrypted bodies so the frame stays parseable.
+    var errorCode = wasm.frameEncryptor_encrypt(activeEncryptor, handlerType || 0, buf, len, buf, max, 0, 0, sizePtr);
     var outLen = readI32(sizePtr);
     var out = errorCode === 0 && outLen > 0 ? readBytes(buf, outLen) : null;
-    wasm.free(buf);
-    wasm.free(sizePtr);
     return { errorCode: errorCode, data: out };
   }
 
   function decryptFrame(data) {
     if (!decryptor) return { errorCode: 1, data: null };
     var len = data.length;
-    var inBuf = alloc(data);
-    var outBuf = allocZeros(len);
-    var sizePtr = allocZeros(4);
+    var inBuf = scratchBuffer("in", len);
+    var outBuf = scratchBuffer("out", len);
+    heap.set(data, inBuf);
+    heap.fill(0, outBuf, outBuf + len);
+    heap.fill(0, sizePtr, sizePtr + 4);
     var errorCode = wasm.frameDecryptor_decrypt(decryptor, inBuf, len, outBuf, len, 0, 0, sizePtr);
     var outLen = readI32(sizePtr);
     var out = errorCode === 0 && outLen > 0 ? readBytes(outBuf, outLen) : null;
-    wasm.free(inBuf);
-    wasm.free(outBuf);
-    wasm.free(sizePtr);
     return { errorCode: errorCode, data: out };
+  }
+
+  function frameData(data) {
+    return typeof data === "string" ? Buffer.from(data, "base64") : data;
+  }
+
+  // Frame timing (E2EE_TIMING=1): once a second, how many frames the runner
+  // handled, the time spent in the wasm, and the largest gap in which no
+  // message arrived (a stall on either side shows up as a large gap).
+  var timing = process.env.E2EE_TIMING ? { frames: 0, busyMs: 0, maxMs: 0, maxBytes: 0, maxGapMs: 0, last: 0 } : null;
+  if (timing) {
+    setInterval(function() {
+      send({ t: "log", message: "timing frames=" + timing.frames + " busyMs=" + timing.busyMs.toFixed(1) +
+        " maxMs=" + timing.maxMs.toFixed(2) + " maxBytes=" + timing.maxBytes +
+        " maxGapMs=" + timing.maxGapMs.toFixed(0) });
+      timing.frames = 0; timing.busyMs = 0; timing.maxMs = 0; timing.maxBytes = 0; timing.maxGapMs = 0;
+    }, 1000).unref();
+  }
+  function timed(data, fn) {
+    if (!timing) return fn();
+    var start = performance.now();
+    if (timing.last) timing.maxGapMs = Math.max(timing.maxGapMs, start - timing.last);
+    var result = fn();
+    var end = performance.now();
+    timing.last = end;
+    timing.frames++;
+    timing.busyMs += end - start;
+    timing.maxMs = Math.max(timing.maxMs, end - start);
+    timing.maxBytes = Math.max(timing.maxBytes, data.length);
+    return result;
   }
 
   // -------------------------------------------------------------------------
@@ -590,21 +648,26 @@ function main(wasm, input, memory) {
           break;
 
         case "encrypt": {
-          var encResult = encryptFrame(Buffer.from(message.data, "base64"));
+          var plainFrame = frameData(message.data);
+          var encResult = timed(plainFrame, function() {
+            return encryptFrame(plainFrame, message.handlerType,
+              message.track === "video" ? videoEncryptor : encryptor);
+          });
           send({
             t: "frame", id: message.id, dir: "encrypt",
             errorCode: encResult.errorCode,
-            data: encResult.data ? encResult.data.toString("base64") : null
+            data: encResult.data
           });
           break;
         }
 
         case "decrypt": {
-          var decResult = decryptFrame(Buffer.from(message.data, "base64"));
+          var cipherFrame = frameData(message.data);
+          var decResult = timed(cipherFrame, function() { return decryptFrame(cipherFrame); });
           send({
             t: "frame", id: message.id, dir: "decrypt",
             errorCode: decResult.errorCode,
-            data: decResult.data ? decResult.data.toString("base64") : null
+            data: decResult.data
           });
           break;
         }

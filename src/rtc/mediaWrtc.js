@@ -133,7 +133,16 @@ MediaSessionWrtc.prototype.applyOpusBitrate = function() {
     var params = sender.getParameters();
     if (!params || !params.encodings || !params.encodings.length) return;
     params.encodings[0].maxBitrate = bitrate;
-    sender.setParameters(params);
+    // @roamhq/wrtc's setParameters rejects asynchronously on modifications it
+    // considers invalid (InvalidModificationError); a sync try/catch misses
+    // that and Node then crashes on the unhandled rejection. The bitrate hint
+    // is optional, so swallow either failure.
+    var result = sender.setParameters(params);
+    if (result && typeof result.catch === "function") {
+      result.catch(function(e) {
+        log.verbose("call", "Media: could not set the Opus bitrate: " + (e && e.message));
+      });
+    }
     log.info("call", "Media: Opus bitrate set to " + bitrate + " bps");
   } catch (e) {
     log.verbose("call", "Media: could not set the Opus bitrate: " + e.message);

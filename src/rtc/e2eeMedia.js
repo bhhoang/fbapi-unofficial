@@ -9,8 +9,9 @@
 //     (the signaling client turns them into DATA_MESSAGEs).
 //   - The server E2eeState from the JOIN response and every received E2eeKey
 //     DATA_MESSAGE are forwarded to the runner.
-//   - Encoded audio frames are sent to the runner for SFrame encryption /
-//     decryption (one request per frame, answered in order).
+//   - Encoded frames are sent to the runner for SFrame encryption /
+//     decryption (one request per frame, pipelined and answered in order).
+//     The channel uses advanced serialization so frames travel as binary.
 //
 // The runner also learns the peer identity keys carried by the server state so
 // the wasm can verify the E2eeKey exchange.
@@ -22,7 +23,9 @@ var e2eeState = require("./e2eeState");
 var thrift = require("./thrift");
 var TType = thrift.TType;
 
-var MAX_PENDING_FRAMES = 100;
+// In-flight limits per queue: about 2 s of audio, and about 3 s of video
+// (three simulcast layers) so a short stall doesn't drop mid-GOP frames.
+var MAX_PENDING_FRAMES = { audio: 100, video: 300 };
 
 // ---------------------------------------------------------------------------
 // Server-state parsing: pull "<userId>:<deviceId>" -> identity key out of the
@@ -118,6 +121,14 @@ function identityKeysFromDevice(device) {
   return keys;
 }
 
+// Frame payloads cross the IPC channel as binary (advanced serialization);
+// base64 strings are still accepted.
+function toBuffer(data) {
+  if (data == null) return null;
+  if (typeof data === "string") return Buffer.from(data, "base64");
+  return Buffer.isBuffer(data) ? data : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+}
+
 // ---------------------------------------------------------------------------
 
 function E2eeMediaSession(options) {
@@ -130,6 +141,9 @@ function E2eeMediaSession(options) {
   this.nextFrameId = 1;
   this.pendingFrames = {};
   this.pendingCount = 0;
+  // In-flight frames per "<dir>:<track>", so a video burst can't make audio
+  // hit the backpressure limit.
+  this.pendingByQueue = {};
   this.droppedFrames = 0;
   this.encryptionEnabled = false;
   // Set by the signaling client: function (recipientUserId, dataBuffer) {}
@@ -163,7 +177,8 @@ E2eeMediaSession.prototype.start = function(callback) {
   try {
     this.child = childProcess.fork(runnerPath, [JSON.stringify(input)], {
       execArgv: ["--experimental-wasm-type-reflection"],
-      stdio: ["ignore", "pipe", "pipe", "ipc"]
+      stdio: ["ignore", "pipe", "pipe", "ipc"],
+      serialization: "advanced"
     });
   } catch (e) {
     return callback(e);
@@ -188,8 +203,13 @@ E2eeMediaSession.prototype.start = function(callback) {
     if (self.pendingCount) {
       log.warn("call", "E2EE media runner exited with " + self.pendingCount + " frames pending");
     }
+    var pending = self.pendingFrames;
     self.pendingFrames = {};
     self.pendingCount = 0;
+    self.pendingByQueue = {};
+    Object.keys(pending).forEach(function(id) {
+      pending[id].callback(new Error("runner gone"), -1, null);
+    });
     if (!self.exitNotified && code !== 0) {
       log.warn("call", "E2EE media runner exited with code " + code);
     }
@@ -221,7 +241,8 @@ E2eeMediaSession.prototype.handleChildMessage = function(message) {
       if (!pending) return;
       delete this.pendingFrames[message.id];
       this.pendingCount--;
-      pending(null, message.errorCode, message.data ? Buffer.from(message.data, "base64") : null);
+      this.pendingByQueue[pending.queue]--;
+      pending.callback(null, message.errorCode, toBuffer(message.data));
       break;
     }
 
@@ -329,11 +350,13 @@ E2eeMediaSession.prototype.setRemoteE2eeId = function(id) {
   this.sendToChild({ t: "setRemoteE2eeId", id: id });
 };
 
-// One encrypted frame in flight per direction is enough for audio; when the
-// runner falls behind, frames are dropped instead of queued without bound.
-E2eeMediaSession.prototype.requestFrame = function(dir, data, callback) {
+// Frames are pipelined (the runner answers in order); when it falls behind,
+// a queue's frames are dropped instead of queued without bound.
+E2eeMediaSession.prototype.requestFrame = function(dir, data, handlerType, track, callback) {
   if (!this.ready || this.closed) return callback(new Error("not ready"), -1, null);
-  if (this.pendingCount >= MAX_PENDING_FRAMES) {
+  track = track || "audio";
+  var queue = dir + ":" + track;
+  if ((this.pendingByQueue[queue] || 0) >= (MAX_PENDING_FRAMES[track] || MAX_PENDING_FRAMES.audio)) {
     this.droppedFrames++;
     if (this.droppedFrames === 1 || this.droppedFrames % 100 === 0) {
       log.warn("call", "E2EE media: dropping frames (runner is behind, " +
@@ -342,24 +365,36 @@ E2eeMediaSession.prototype.requestFrame = function(dir, data, callback) {
     return callback(new Error("backpressure"), -1, null);
   }
   var id = this.nextFrameId++;
-  this.pendingFrames[id] = callback;
+  this.pendingFrames[id] = { callback: callback, queue: queue };
   this.pendingCount++;
-  if (!this.sendToChild({ t: dir, id: id, data: data.toString("base64") })) {
+  this.pendingByQueue[queue] = (this.pendingByQueue[queue] || 0) + 1;
+  if (!this.sendToChild({ t: dir, id: id, handlerType: handlerType || 0, track: track, data: data })) {
     delete this.pendingFrames[id];
     this.pendingCount--;
+    this.pendingByQueue[queue]--;
     return callback(new Error("runner gone"), -1, null);
   }
 };
 
+// handlerType: 0 = Generic (audio), 3 = H264 (video frames). `track` selects
+// the per-track frame encryptor (separate counters, like the web client).
 // callback(err, errorCode, encryptedBuffer)
-E2eeMediaSession.prototype.encrypt = function(data, callback) {
+E2eeMediaSession.prototype.encrypt = function(data, handlerType, track, callback) {
+  if (typeof handlerType === "function") {
+    callback = handlerType;
+    handlerType = 0;
+    track = "audio";
+  } else if (typeof track === "function") {
+    callback = track;
+    track = "audio";
+  }
   if (!this.encryptionEnabled) return callback(null, 0, data);
-  this.requestFrame("encrypt", data, callback);
+  this.requestFrame("encrypt", data, handlerType, track, callback);
 };
 
 // callback(err, errorCode, plainBuffer)
 E2eeMediaSession.prototype.decrypt = function(data, callback) {
-  this.requestFrame("decrypt", data, callback);
+  this.requestFrame("decrypt", data, 0, "audio", callback);
 };
 
 E2eeMediaSession.prototype.close = function() {

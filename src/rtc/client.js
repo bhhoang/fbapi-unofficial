@@ -192,16 +192,37 @@ function buildSyncPayload(options) {
   return { stateStore: stateStore, stateStoreV2: {} };
 }
 
+// The web client declares these in every join (captured from Messenger web,
+// which gets video forwarded; the library sent none).
+var USER_CAPABILITIES = JSON.stringify({
+  AddParticipantEnabled: false,
+  GROUP_COWATCH: true,
+  MultipleVideoStreamsAllowed: true,
+  MW_AV_ESCALATION: true,
+  canApproveCollaborationSpaceJoinRequests: true,
+  cowatch: true,
+  screen_sharing: false,
+  sctpSecondPc: false
+});
+
 // Shared join body for outgoing calls and accepted incoming calls.
 function buildJoinRequest(call, options) {
+  // Messenger web starts 1:1 calls P2P (the server escalates them to the SFU
+  // once the peer answers) and group calls on the SFU. Our outgoing video
+  // calls join the SFU directly: a web callee otherwise builds a P2P leg from
+  // our offer that never connects (we only talk to the SFU), and its
+  // participant model keeps that leg's ended video track, so it showed our
+  // avatar instead of the video. The web client declares the P2P
+  // capabilities either way.
   var mediaMode = options.mediaMode != null
     ? options.mediaMode
-    : (call.isGroup ? proto.MediaPath.SFU : proto.MediaPath.P2P);
-  var capabilities = baseCapabilities.slice();
-  if (mediaMode === proto.MediaPath.P2P) {
-    capabilities = capabilities.concat(p2pCapabilities);
-  }
-  var media = buildMediaStatus(call.isVideo, {
+    : (call.mediaPath != null
+      ? call.mediaPath
+      : (call.isGroup || (call.isVideo && call.direction === "outgoing")
+        ? proto.MediaPath.SFU
+        : proto.MediaPath.P2P));
+  var capabilities = baseCapabilities.concat(p2pCapabilities);
+  var media = buildMediaStatus(call.isVideo && !options.deferVideo, {
     audio: options.audioTrackId,
     video: options.videoTrackId
   });
@@ -212,21 +233,32 @@ function buildJoinRequest(call, options) {
   var offerSdp = options.offerSdp ||
     (options.answerSdp ? null : buildOfferSdp({ video: call.isVideo }));
 
+  // An accepting client must echo the caller's E2EE requirements: sending
+  // different ones (for example forcing preventSfuMode) makes the server
+  // reject the join with "Mismatch in the E2EE requirements of the JOIN".
+  var enforcement = call.e2eeEnforcement || {};
+  var joinEnforcement = {
+    mode: enforcement.mode != null
+      ? enforcement.mode
+      : (isE2eeMandated ? proto.E2eeMode.E2EE_MANDATED : proto.E2eeMode.E2EE_NOT_MANDATED),
+    // Messenger web sends false: the call may use the SFU. Preventing it
+    // while the server routes the call through the SFU anyway left E2EE
+    // disabled (errorCode 3).
+    preventSfuMode: enforcement.preventSfuMode != null
+      ? !!enforcement.preventSfuMode
+      : (options.preventSfuMode != null ? !!options.preventSfuMode : false),
+    infraMandatedExpStatus: enforcement.infraMandatedExpStatus != null
+      ? enforcement.infraMandatedExpStatus
+      : proto.E2eeInfraMandatedExpStatus.NOT_SET
+  };
+
   var joinRequest = {
     offer: offerSdp ? { sdpString: offerSdp } : {},
     deviceCapabilities: capabilities,
+    userCapabilities: Buffer.from(USER_CAPABILITIES, "utf8"),
     mediaStatus: media.mediaStatus,
     mediaStatusEx: media.mediaStatusEx,
-    e2eeEnforcement: {
-      mode: isE2eeMandated ? proto.E2eeMode.E2EE_MANDATED : proto.E2eeMode.E2EE_NOT_MANDATED,
-      // E2EE media only works peer-to-peer here: the SFU path needs media the
-      // frame-encryption engine cannot carry on this network. Ask the server
-      // to keep the call direct.
-      preventSfuMode: options.preventSfuMode != null
-        ? !!options.preventSfuMode
-        : (isE2eeMandated && !call.isGroup),
-      infraMandatedExpStatus: proto.E2eeInfraMandatedExpStatus.NOT_SET
-    },
+    e2eeEnforcement: joinEnforcement,
     clientMediaMode: mediaMode,
     endpointSettings: { joinMode: proto.JoinMode.PRIMARY }
   };
@@ -457,6 +489,9 @@ CallClient.prototype.prepareMediaForOutgoing = function(options, callback) {
   if (!options.media) return callback();
   var self = this;
   var mediaOptions = options.media === true ? {} : Object.assign({}, options.media);
+  // Video needs the werift engine; tell the session factory even when no
+  // video file is given (the other side's video still has to be rendered).
+  if (options.video && mediaOptions.wantsVideo == null) mediaOptions.wantsVideo = true;
   // Hold the audio file until the other side actually joins the call.
   if (mediaOptions.holdAudio == null) mediaOptions.holdAudio = mediaOptions.autoStart !== true;
   this.applyGlobalMediaOptions(mediaOptions);
@@ -492,6 +527,7 @@ CallClient.prototype.prepareMediaForIncoming = function(call, options, callback)
   if (!options.media) return callback();
   var self = this;
   var mediaOptions = options.media === true ? {} : Object.assign({}, options.media);
+  if (call && call.isVideo && mediaOptions.wantsVideo == null) mediaOptions.wantsVideo = true;
   if (mediaOptions.holdAudio == null) mediaOptions.holdAudio = mediaOptions.autoStart !== true;
   this.applyGlobalMediaOptions(mediaOptions);
   options.audioDelayMs = mediaOptions.audioDelayMs;
@@ -575,28 +611,37 @@ CallClient.prototype.attachMediaSession = function(session, call) {
     });
 
     // The web client also publishes its local media state once the connection
-    // is up; the SFU uses it to start forwarding our audio.
-    var trackId = activeCall.audioTrackId;
-    if (!trackId) return;
+    // is up; the SFU uses it to start forwarding our audio (and video).
     var mediaStatus = {};
-    mediaStatus[trackId] = true;
     var tracks = {};
-    tracks[trackId] = {
-      enabled: true,
-      customVideoContentType: 0,
-      customAudioContentType: 0,
-      label: proto.TrackLabel.DEFAULT_AUDIO
-    };
+    function addLocalTrack(id, label) {
+      if (!id) return;
+      mediaStatus[id] = true;
+      tracks[id] = {
+        enabled: true,
+        customVideoContentType: 0,
+        customAudioContentType: 0,
+        label: label
+      };
+    }
+    addLocalTrack(activeCall.audioTrackId, proto.TrackLabel.DEFAULT_AUDIO);
+    addLocalTrack(activeCall.videoTrackId, proto.TrackLabel.DEFAULT_VIDEO);
+    if (!Object.keys(mediaStatus).length) return;
     var updateHeader = self.buildHeader(proto.MessageType.CLIENT_MEDIA_UPDATE, activeCall, {});
+    // The version is our current SDP session version (see stampOrigin), the
+    // same number the renegotiation used; a hard-coded 0 -> 1 was rejected
+    // with 409 once the renegotiation had moved it on.
+    var mediaVersion = session.sdpVersion || activeCall.clientMediaVersion || 1;
+    activeCall.clientMediaVersion = mediaVersion;
     self.send(updateHeader, {
       clientMediaUpdateRequest: {
-        fromVersion: 0,
-        toVersion: 1,
+        fromVersion: mediaVersion,
+        toVersion: mediaVersion,
         mediaUpdates: [{ mediaStatus: mediaStatus, mediaStatusEx: { tracks: tracks } }]
       }
     }, function(err) {
       if (err) log.warn("call", "Could not publish the local media state: " + err.message);
-      else log.info("call", "Media: published the local media state (audio enabled)");
+      else log.info("call", "Media: published the local media state (" + Object.keys(mediaStatus).length + " track(s))");
     });
   };
 };
@@ -615,7 +660,8 @@ CallClient.prototype.subscribeToMediaStatus = function(call, mediaStatus) {
     if (!track) return;
     if (track.owner && track.owner === self.ctx.userID) return;
     if (track.enabled === false) return;
-    if (track.label != null && track.label !== proto.TrackLabel.DEFAULT_AUDIO) return;
+    if (track.label != null && track.label !== proto.TrackLabel.DEFAULT_AUDIO &&
+      track.label !== proto.TrackLabel.DEFAULT_VIDEO) return;
     if (call.subscribed[trackId]) return;
     call.subscribed[trackId] = true;
     subscriptions.push({
@@ -634,8 +680,8 @@ CallClient.prototype.subscribeToMediaStatus = function(call, mediaStatus) {
   });
 };
 
-// Subscribe to the other participants' audio tracks (SFU conferences only
-// deliver tracks the client has subscribed to).
+// Subscribe to the other participants' tracks (SFU conferences only deliver
+// tracks the client has subscribed to; the web client subscribes to video too).
 CallClient.prototype.subscribeToRemoteAudio = function(call, update) {
   if (!call || !call.serverInfoData) return;
   var self = this;
@@ -643,14 +689,14 @@ CallClient.prototype.subscribeToRemoteAudio = function(call, update) {
   var subscriptions = [];
   (update.mediaUpdates || []).forEach(function(mediaUpdate) {
     (mediaUpdate.media || []).forEach(function(track) {
-      if (track.type !== proto.MediaType.AUDIO) return;
+      if (track.type !== proto.MediaType.AUDIO && track.type !== proto.MediaType.VIDEO) return;
       if (track.owner && track.owner === self.ctx.userID) return;
       var key = mediaUpdate.sourceKey + "|" + track.id;
       if (call.subscribed[key]) return;
       call.subscribed[key] = true;
       subscriptions.push({
         cname: mediaUpdate.sourceKey,
-        type: proto.SubscriptionType.SUBSCRIBE,
+        type: proto.SubscriptionType.TRACK,
         trackId: track.id
       });
     });
@@ -666,12 +712,13 @@ CallClient.prototype.subscribeToRemoteAudio = function(call, update) {
 
 // Starts the outgoing audio file a moment after the peer is in the call, so
 // the beginning of a WAV is not played to an empty conference. The delay is
-// `media.audioDelayMs` (default 3000 ms).
+// `media.audioDelayMs` (default 500 ms).
 CallClient.prototype.startCallAudio = function(call, reason) {
   if (!call || !call.mediaSession || call.audioStarted) return;
   call.audioStarted = true;
-  var delay = call.audioDelayMs != null ? call.audioDelayMs : 3000;
-  log.info("call", "Media: " + reason + "; starting the audio in " + Math.round(delay / 1000) + "s");
+  var delay = call.audioDelayMs != null ? call.audioDelayMs : 500;
+  log.info("call", "Media: " + reason + "; starting the audio in " + delay + " ms");
+  if (typeof call.mediaSession.prewarmVideo === "function") call.mediaSession.prewarmVideo();
   setTimeout(function() {
     if (call.state === "ended" || !call.mediaSession) return;
     call.mediaSession.startAudio();
@@ -721,6 +768,16 @@ CallClient.prototype.onDataMessage = function(message) {
   if (!generic || !generic.data) return;
 
   var call = this.findCallForMessage(message);
+  // Acknowledge every data message with an empty response carrying the same
+  // transaction (that is how the web client stops the sender's retries).
+  var ackHeader = this.buildHeader(proto.MessageType.DATA_MESSAGE, call, {
+    transactionId: message.messageHeader.transactionId,
+    responseStatusCode: proto.RtcResponseStatusCode.OK
+  });
+  this.send(ackHeader, {}, function(err) {
+    if (err) log.verbose("call", "Could not acknowledge a data message: " + err.message);
+  });
+
   var session = call && call.mediaSession && call.mediaSession.e2eeMedia;
   if (generic.topic === "E2eeKey") {
     log.verbose("call", "E2EE media: received " + generic.data.length + " bytes of key material");
@@ -1015,6 +1072,9 @@ CallClient.prototype.handleMessage = function(message) {
       case proto.MessageType.UPDATE:
         if (header.responseStatusCode == null) this.onUpdateRequest(decoded);
         break;
+      case proto.MessageType.NOTIFY:
+        if (header.responseStatusCode == null) this.onNotifyRequest(decoded);
+        break;
       case proto.MessageType.APPROVAL:
         this.emitCallEvent("approval", this.calls[header.conferenceName], decoded);
         break;
@@ -1098,7 +1158,11 @@ CallClient.prototype.onJoinResponse = function(message) {
     this.mediaCall = call;
     this.flushLocalCandidates(call);
     this.refreshMediaRelays(call, response.relayInfo);
-    this.subscribeToMediaStatus(call, response.mediaStatus);
+    // In a JOIN response `mediaStatus` is a plain {trackId: bool} map; the
+    // track details (owner, label) are in `mediaStatusEx`. Passing the plain
+    // map meant the peer's video was never subscribed to, so the SFU never
+    // forwarded it (Messenger web subscribes to it right after joining).
+    this.subscribeToMediaStatus(call, response.mediaStatusEx);
   }
 
   if (call.direction === "outgoing" && call.state === "starting") {
@@ -1195,8 +1259,9 @@ CallClient.prototype.onServerMediaUpdate = function(message) {
   // The server escalates a call to the SFU by requesting a renegotiation
   // (`renegotiationRequested`); the client acknowledges it and then sends a
   // fresh offer as a CLIENT_MEDIA_UPDATE request (the SFU answers).
-  if (update.renegotiationRequested === true) {
-    this.acknowledgeRenegotiation(call, message, update);
+    if (update.renegotiationRequested === true) {
+      call.renegotiationRequested = true;
+      this.acknowledgeRenegotiation(call, message, update);
     this.initiateClientRenegotiation(call, update);
     if (call.state !== "connected") this.setConnected(call);
     return;
@@ -1207,6 +1272,7 @@ CallClient.prototype.onServerMediaUpdate = function(message) {
     this.flushLocalCandidates(call);
     this.subscribeToRemoteAudio(call, update);
     this.subscribeToMediaStatus(call, update.mediaStatus);
+    this.renegotiateForPeerStreams(call, update);
   }
 
   // State-sync updates can carry a newer server E2eeState (key rotation).
@@ -1221,11 +1287,63 @@ CallClient.prototype.onServerMediaUpdate = function(message) {
   // new answer (the web client does this too).
   if (update.offer && update.offer.sdpString && call.mediaSession) {
     this.answerServerMediaUpdate(call, message, update);
+  } else if (update.renegotiationRequested !== true) {
+    // Every other server media update still has to be acknowledged with the
+    // new version; without the acknowledgement the server retries the same
+    // update forever and never advances the media state (video forwarding
+    // waits for this acknowledgement).
+    this.acknowledgeMediaUpdate(call, message, update);
   }
 
   if ((answer || update.toVersion) && call.state !== "connected") {
     this.setConnected(call);
   }
+};
+
+// The E2EE stack learns the peer's media identity ("<userId>:<cname>") from
+// the a=ssrc cname of the peer's streams in an SDP from the server; until then
+// our E2EE key isn't sent and the peer can't decrypt our audio or video. The
+// server adds the peer's streams either to its answer to our renegotiation
+// (when the peer is already set up) or through an offer in a later update;
+// in calls we place that later update often arrives without one. So when the
+// server announces the peer's tracks and we still don't know their cname,
+// renegotiate once more on the same connection: the answer then lists them.
+CallClient.prototype.renegotiateForPeerStreams = function(call, update) {
+  var session = call.mediaSession;
+  if (!session || !session.e2eeMedia || session.remoteCname) return;
+  // A call escalated from P2P renegotiates once the server asks it to; a call
+  // that joined the SFU directly never gets that request, and without this
+  // renegotiation the peer never received our key.
+  if (call.peerStreamsRenegotiated) return;
+  if (!call.renegotiationRequested && call.mediaPath !== proto.MediaPath.SFU) return;
+  if (update.offer && update.offer.sdpString) return;
+  if (!session.remoteDescriptionSet) return;
+  var self = this;
+  var tracks = (update.mediaStatus && update.mediaStatus.tracks) || {};
+  var peerTracks = Object.keys(tracks).filter(function(id) {
+    var track = tracks[id];
+    return track && track.owner && String(track.owner) !== String(self.ctx.userID);
+  });
+  if (!peerTracks.length) return;
+  call.peerStreamsRenegotiated = true;
+  log.info("call", "Media: the peer's streams aren't in our SDP yet; renegotiating to get them");
+  this.initiateClientRenegotiation(call, {});
+};
+
+// Acknowledges a server media update: the response echoes the version the
+// client has (currentVersion = the update's toVersion).
+CallClient.prototype.acknowledgeMediaUpdate = function(call, message, update) {
+  var header = this.buildHeader(proto.MessageType.SERVER_MEDIA_UPDATE, call, {
+    transactionId: message.messageHeader.transactionId,
+    responseStatusCode: proto.RtcResponseStatusCode.OK
+  });
+  var version = update.toVersion != null ? String(update.toVersion) : "0";
+  this.send(header, {
+    serverMediaUpdateResponse: { currentVersion: version }
+  }, function(err) {
+    if (err) log.warn("call", "Could not acknowledge the media update: " + err.message);
+    else log.verbose("call", "Media: acknowledged the media update (v" + version + ")");
+  });
 };
 
 // Acknowledges an SMU renegotiation request: the response echoes the version
@@ -1256,7 +1374,12 @@ CallClient.prototype.initiateClientRenegotiation = function(call, update) {
   // recreated. That is what makes the SFU path reachable on networks that
   // block direct UDP.
   var session = call.mediaSession;
-  if (update.relayInfo) {
+  // Messenger web renegotiates on the same connection, keeping its tracks. A
+  // recreated session has new track ids, DTLS fingerprint and cname that the
+  // server never saw in the JOIN, and the server accepted such an offer but
+  // never answered it. Recreating (to pick up the relays) is opt-in, for
+  // networks where only the TURN relays work.
+  if (update.relayInfo && session.options && session.options.recreateForRelays === true) {
     var servers = turn.toIceServers(update.relayInfo);
     if (servers.length) {
       // Facebook's SFU advertises UDP and TCP host candidates; on networks
@@ -1274,14 +1397,23 @@ CallClient.prototype.initiateClientRenegotiation = function(call, update) {
           servers.length + " server(s))");
         this.attachMediaSession(recreated, call);
         call.mediaSession = recreated;
-        if (recreated.trackIds) call.audioTrackId = recreated.trackIds.audio;
+        if (recreated.trackIds) {
+          call.audioTrackId = recreated.trackIds.audio;
+          call.videoTrackId = recreated.trackIds.video;
+        }
+        // The new session has to (re)start its own audio/video.
+        call.audioStarted = false;
         session.close();
         session = recreated;
       }
     }
   }
 
-  var version = update.toVersion != null ? String(update.toVersion) : "0";
+  // The renegotiation carries a new offer but no media-state change, so the
+  // version stays the same (Messenger web sends e.g. 7 -> 7). Bumping it
+  // (0 -> 1) got the update rejected with 503 "Endpoint rate-limited".
+  var version = call.clientMediaVersion || 0;
+  var nextVersion = version;
   session.createOffer(function(err, sdp) {
     if (err) {
       log.warn("call", "Could not create the renegotiation offer: " + err.message);
@@ -1291,29 +1423,44 @@ CallClient.prototype.initiateClientRenegotiation = function(call, update) {
       session.e2eeMedia.setLocalE2eeId(self.ctx.userID + ":" + session.localCname);
     }
     self.withDtlsAuth(sdp, { e2ee: call.e2ee }, function(authErr, signedSdp) {
-      var trackId = call.audioTrackId;
       var mediaStatus = {};
       var tracks = {};
-      if (trackId) {
-        mediaStatus[trackId] = true;
-        tracks[trackId] = {
+      function addTrack(id, label) {
+        if (!id) return;
+        mediaStatus[id] = true;
+        tracks[id] = {
           enabled: true,
           customVideoContentType: 0,
           customAudioContentType: 0,
-          label: proto.TrackLabel.DEFAULT_AUDIO
+          label: label
         };
+      }
+      addTrack(call.audioTrackId, proto.TrackLabel.DEFAULT_AUDIO);
+      addTrack(call.videoTrackId, proto.TrackLabel.DEFAULT_VIDEO);
+      // The versions are the offer's SDP session version (the second number
+      // of its o= line); Messenger web's "7 -> 7" goes with "o=- <id> 7 ...".
+      // With any other number the server accepts the update but never
+      // answers the offer.
+      var origin = /^o=\S+\s+\d+\s+(\d+)/m.exec(signedSdp);
+      if (origin) {
+        version = Number(origin[1]);
+        nextVersion = version;
       }
       var header = self.buildHeader(proto.MessageType.CLIENT_MEDIA_UPDATE, call, {});
       self.send(header, {
         clientMediaUpdateRequest: {
           fromVersion: version,
-          toVersion: version,
+          toVersion: nextVersion,
           mediaUpdates: [{ mediaStatus: mediaStatus, mediaStatusEx: { tracks: tracks } }],
           offer: { sdpString: signedSdp }
         }
       }, function(sendErr) {
         if (sendErr) log.warn("call", "Could not send the renegotiation offer: " + sendErr.message);
-        else log.info("call", "Media: sent the renegotiation offer (" + signedSdp.length + " bytes)");
+        else {
+          call.clientMediaVersion = nextVersion;
+          log.info("call", "Media: sent the renegotiation offer (" + signedSdp.length + " bytes, v" +
+            version + "->" + nextVersion + ")");
+        }
       });
     });
   });
@@ -1326,16 +1473,21 @@ CallClient.prototype.answerServerMediaUpdate = function(call, message, update) {
     responseStatusCode: proto.RtcResponseStatusCode.OK
   });
 
+  // Every published track, like the join: leaving the video out here told the
+  // conference our video was gone after each SFU renegotiation.
   function mediaStatus() {
-    var trackId = call.audioTrackId;
-    if (!trackId) return undefined;
+    if (!call.audioTrackId) return undefined;
     var tracks = {};
-    tracks[trackId] = {
-      enabled: true,
-      customVideoContentType: 0,
-      customAudioContentType: 0,
-      label: proto.TrackLabel.DEFAULT_AUDIO
-    };
+    [[call.audioTrackId, proto.TrackLabel.DEFAULT_AUDIO],
+      [call.videoTrackId, proto.TrackLabel.DEFAULT_VIDEO]].forEach(function(entry) {
+      if (!entry[0]) return;
+      tracks[entry[0]] = {
+        enabled: true,
+        customVideoContentType: 0,
+        customAudioContentType: 0,
+        label: entry[1]
+      };
+    });
     return { tracks: tracks };
   }
 
@@ -1361,6 +1513,15 @@ CallClient.prototype.onClientMediaUpdate = function(message) {
   var call = this.findCallForMessage(message);
   if (!call) return;
   this.emitCallEvent("media", call, message);
+
+  // A rejected media update (e.g. 503 "Endpoint rate-limited") has no body;
+  // the renegotiation it carried never takes effect, so say so.
+  var header = message.messageHeader || {};
+  if (header.responseStatusCode != null && header.responseStatusCode !== proto.RtcResponseStatusCode.OK) {
+    log.warn("call", "Facebook rejected a media update: " + header.responseStatusCode +
+      (header.responseSubCode != null ? "/" + header.responseSubCode : "") +
+      (header.responseStatusMessage ? " " + header.responseStatusMessage : ""));
+  }
 
   var response = message.messageBody.clientMediaUpdateResponse;
   if (!response) return;
@@ -1413,6 +1574,7 @@ CallClient.prototype.onConferenceState = function(message) {
       // Release a held audio file only once someone else is really in the call.
       if (userID !== self.ctx.userID && state === 9) {
         self.startCallAudio(call, "peer joined");
+        self.refreshE2eeState(call);
       }
     });
     call.participantStates = states;
@@ -1429,6 +1591,72 @@ CallClient.prototype.onConferenceState = function(message) {
     conferenceStateResponse: { currentVersion: request.version }
   }, function(err) {
     if (err) log.warn("call", "Could not answer conference state request: " + err.message);
+  });
+};
+
+// In a call we place, the peer joins after our media state was published, so
+// the E2eeState we got back doesn't list them: the frame-encryption stack
+// never sends them our key and they can't decrypt our audio or video.
+// Messenger web re-sends its media state with unchanged versions a few seconds
+// after joining; the server's answer (handled in onClientMediaUpdate) carries
+// the current E2eeState. Do the same once, when the peer joins.
+CallClient.prototype.refreshE2eeState = function(call) {
+  if (!call || call.e2eeStateRefreshed || call.clientMediaVersion == null) return;
+  if (!call.mediaSession || !call.mediaSession.e2eeMedia) return;
+  call.e2eeStateRefreshed = true;
+
+  var mediaStatus = {};
+  var tracks = {};
+  function addTrack(id, label) {
+    if (!id) return;
+    mediaStatus[id] = true;
+    tracks[id] = { enabled: true, customVideoContentType: 0, customAudioContentType: 0, label: label };
+  }
+  addTrack(call.audioTrackId, proto.TrackLabel.DEFAULT_AUDIO);
+  addTrack(call.videoTrackId, proto.TrackLabel.DEFAULT_VIDEO);
+  var version = call.clientMediaVersion;
+  var header = this.buildHeader(proto.MessageType.CLIENT_MEDIA_UPDATE, call, {});
+  this.send(header, {
+    clientMediaUpdateRequest: {
+      fromVersion: version,
+      toVersion: version,
+      mediaUpdates: [{ mediaStatus: mediaStatus, mediaStatusEx: { tracks: tracks } }]
+    }
+  }, function(err) {
+    if (err) log.warn("call", "Could not refresh the E2EE state: " + err.message);
+    else log.info("call", "E2EE media: asked for the current E2eeState (peer joined)");
+  });
+};
+
+// State-sync notifications carry server state (config_engine, coplay, the
+// E2eeState, ...). Messenger web answers each one with the topic and version
+// it applied; unanswered, the server keeps re-sending them, and in calls we
+// placed the E2eeState listing the participant who joined later never came,
+// so our E2EE key was never sent and the peer couldn't decrypt our media.
+CallClient.prototype.onNotifyRequest = function(message) {
+  var call = this.findCallForMessage(message);
+  var request = message.messageBody.notifyRequest;
+  if (!call || !request) return;
+
+  var stateStore = (request.syncPayload && request.syncPayload.stateStore) || {};
+  var topics = Object.keys(stateStore);
+  var e2eeState = stateStore.E2eeState;
+  if (e2eeState && e2eeState.data && call.mediaSession && call.mediaSession.e2eeMedia) {
+    log.info("call", "E2EE media: processing the server E2eeState from a notification");
+    call.mediaSession.e2eeMedia.processServerState(e2eeState.data);
+  }
+
+  var topic = topics.length ? topics[0] : request.topic;
+  var version = topics.length ? stateStore[topics[0]].version : request.version;
+  var header = this.buildHeader(proto.MessageType.NOTIFY, call, {
+    conferenceName: message.messageHeader.conferenceName,
+    serverInfoData: message.messageHeader.serverInfoData,
+    conferenceType: message.messageHeader.conferenceType,
+    transactionId: message.messageHeader.transactionId,
+    responseStatusCode: proto.RtcResponseStatusCode.OK
+  });
+  this.send(header, { notifyResponse: { topic: topic, version: version } }, function(err) {
+    if (err) log.warn("call", "Could not answer a state-sync notification: " + err.message);
   });
 };
 
@@ -1461,9 +1689,16 @@ CallClient.prototype.setConnected = function(call) {
   if (call.state === "connected") return;
   call.state = "connected";
   call.connectedAt = Date.now();
-  // One-to-one calls have no conference state to wait for, so the audio is
-  // scheduled once the call is up. Group calls wait for the peer to join.
-  if (!call.isGroup) this.startCallAudio(call, "call connected");
+  // The held media starts once the peer's participant state reaches CONNECTED
+  // (see onConferenceState). A 1:1 call joined on the SFU is "connected" as
+  // soon as the peer accepts, seconds before they are in the call, so it
+  // waits for that state too; the timer only covers a state that never comes.
+  if (!call.isGroup) {
+    var self = this;
+    setTimeout(function() {
+      if (call.state !== "ended") self.startCallAudio(call, "call connected (no peer state)");
+    }, 10000);
+  }
   this.emitCallEvent("connected", call);
 };
 
@@ -1634,6 +1869,9 @@ CallClient.prototype.acceptWithJoin = function(call, options, callback) {
   call.e2ee = options.e2ee === true;
   call.state = "joining";
   if (call.isGroup == null) call.isGroup = !!call.groupThreadID;
+  // The join response carries the answer to our offer; without the session on
+  // the call it can never be applied and the media stays unnegotiated.
+  if (this.mediaSession) call.mediaSession = this.mediaSession;
   var header = this.buildHeader(proto.MessageType.JOIN, call, {
     sequenceNumber: 0,
     messageTags: []
@@ -1730,5 +1968,7 @@ CallClient.prototype.disconnect = function() {
 module.exports = {
   CallClient: CallClient,
   signalingTopic: signalingTopic,
-  buildOfferSdp: buildOfferSdp
+  buildOfferSdp: buildOfferSdp,
+  // Exported for the unit tests.
+  buildJoinRequest: buildJoinRequest
 };
